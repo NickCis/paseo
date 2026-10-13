@@ -2703,6 +2703,525 @@ describe("ACPAgentSession", () => {
     );
   });
 
+  test("cursor/create_plan emits a plan permission and returns nested accepted on allow", async () => {
+    const session = createSessionWithConfig({ provider: "cursor" });
+    const events: AgentStreamEvent[] = [];
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    session.subscribe((event) => events.push(event));
+
+    const createPlan = session.extMethod("cursor/create_plan", {
+      toolCallId: "plan-tool-1",
+      name: "Ship inventory",
+      overview: "Pending inventory update",
+      plan: "# Ship\n\n1. Inventory\n2. Deploy",
+      todos: [
+        { id: "todo-1", content: "Inventory", status: "completed" },
+        { id: "todo-2", content: "Deploy", status: "pending" },
+      ],
+    });
+
+    await Promise.resolve();
+
+    const timelinePlan = events.find(
+      (event) =>
+        event.type === "timeline" &&
+        event.item.type === "tool_call" &&
+        event.item.name === "plan_approval",
+    );
+    expect(timelinePlan).toMatchObject({
+      type: "timeline",
+      item: {
+        type: "tool_call",
+        callId: "plan-tool-1",
+        name: "plan_approval",
+        status: "running",
+        detail: { type: "plan", text: "# Ship\n\n1. Inventory\n2. Deploy" },
+      },
+    });
+
+    const todoEvent = events.find(
+      (event) => event.type === "timeline" && event.item.type === "todo",
+    );
+    expect(todoEvent).toMatchObject({
+      type: "timeline",
+      item: {
+        type: "todo",
+        items: [
+          { text: "Inventory", completed: true },
+          { text: "Deploy", completed: false },
+        ],
+      },
+    });
+
+    const requested = events.find((event) => event.type === "permission_requested");
+    expect(requested).toMatchObject({
+      type: "permission_requested",
+      request: {
+        kind: "plan",
+        title: "Ship inventory",
+        detail: { type: "plan", text: "# Ship\n\n1. Inventory\n2. Deploy" },
+        metadata: { planText: "# Ship\n\n1. Inventory\n2. Deploy" },
+      },
+    });
+    if (requested?.type !== "permission_requested") {
+      throw new Error("Expected permission request");
+    }
+
+    const implementResult = await session.respondToPermission(requested.request.id, {
+      behavior: "allow",
+      selectedActionId: "implement",
+    });
+
+    await expect(createPlan).resolves.toEqual({
+      outcome: { outcome: "accepted" },
+    });
+    expect(implementResult).toEqual({
+      followUpPrompt:
+        "The user approved the plan. Implement it now. Do not restate or revise the plan unless blocked.",
+    });
+
+    const completedPlan = events.find(
+      (event) =>
+        event.type === "timeline" &&
+        event.item.type === "tool_call" &&
+        event.item.callId === "plan-tool-1" &&
+        event.item.status === "completed",
+    );
+    expect(completedPlan).toMatchObject({
+      item: {
+        metadata: { approved: true },
+        detail: { type: "plan", text: "# Ship\n\n1. Inventory\n2. Deploy" },
+      },
+    });
+  });
+
+  test("cursor/create_plan returns nested rejected on deny", async () => {
+    const session = createSessionWithConfig({ provider: "cursor" });
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    await session.extMethod("cursor/update_todos", {
+      merge: false,
+      todos: [{ id: "keep", content: "Keep me", status: "pending" }],
+    });
+
+    const createPlan = session.extMethod("cursor/create_plan", {
+      toolCallId: "plan-tool-2",
+      plan: "# Reject me",
+      todos: [{ id: "preview", content: "Preview only", status: "pending" }],
+    });
+    await Promise.resolve();
+
+    const requested = events.find((event) => event.type === "permission_requested");
+    if (requested?.type !== "permission_requested") {
+      throw new Error("Expected permission request");
+    }
+
+    const rejectResult = await session.respondToPermission(requested.request.id, {
+      behavior: "deny",
+      selectedActionId: "reject",
+      message: "Not now",
+    });
+
+    await expect(createPlan).resolves.toEqual({
+      outcome: { outcome: "rejected", reason: "Not now" },
+    });
+    expect(rejectResult).toBeUndefined();
+
+    const todoEvents = events.filter(
+      (event) => event.type === "timeline" && event.item.type === "todo",
+    );
+    expect(todoEvents.at(-1)).toMatchObject({
+      item: {
+        type: "todo",
+        items: [{ text: "Keep me", completed: false }],
+      },
+    });
+  });
+
+  test("cursor/create_plan with empty todos clears the previous todo preview", async () => {
+    const session = createSessionWithConfig({ provider: "cursor" });
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    await session.extMethod("cursor/update_todos", {
+      merge: false,
+      todos: [{ id: "old", content: "Old todo", status: "pending" }],
+    });
+
+    const createPlan = session.extMethod("cursor/create_plan", {
+      toolCallId: "plan-tool-empty",
+      plan: "# Empty todos",
+      todos: [],
+    });
+    await Promise.resolve();
+
+    const todoEvents = events.filter(
+      (event) => event.type === "timeline" && event.item.type === "todo",
+    );
+    expect(todoEvents.at(-1)).toMatchObject({
+      item: { type: "todo", items: [] },
+    });
+
+    const requested = events.find((event) => event.type === "permission_requested");
+    if (requested?.type !== "permission_requested") {
+      throw new Error("Expected permission request");
+    }
+    const emptyPlanResult = await session.respondToPermission(requested.request.id, {
+      behavior: "allow",
+      selectedActionId: "implement",
+    });
+    await expect(createPlan).resolves.toEqual({ outcome: { outcome: "accepted" } });
+    expect(emptyPlanResult).toEqual({
+      followUpPrompt:
+        "The user approved the plan. Implement it now. Do not restate or revise the plan unless blocked.",
+    });
+  });
+
+  test("cursor/create_plan Implement leaves plan mode and returns a Codex-style followUpPrompt", async () => {
+    const session = createSessionWithConfig({ provider: "cursor", modeId: "plan" });
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const setSessionMode = vi.fn(async () => undefined);
+    const internals = asInternals<{
+      sessionId: string | null;
+      connection: { setSessionMode: typeof setSessionMode };
+      availableModes: Array<{ id: string; label: string }>;
+      currentMode: string | null;
+    }>(session);
+
+    internals.sessionId = "session-1";
+    internals.connection = { setSessionMode };
+    internals.availableModes = [
+      { id: "agent", label: "Agent" },
+      { id: "plan", label: "Plan" },
+    ];
+    internals.currentMode = "plan";
+
+    const createPlan = session.extMethod("cursor/create_plan", {
+      toolCallId: "plan-continue-1",
+      plan: "# Do the work\n\n1. Inventory\n2. Deploy",
+      todos: [],
+    });
+    await Promise.resolve();
+
+    const requested = events.find((event) => event.type === "permission_requested");
+    if (requested?.type !== "permission_requested") {
+      throw new Error("Expected permission request");
+    }
+
+    const result = await session.respondToPermission(requested.request.id, {
+      behavior: "allow",
+      selectedActionId: "implement",
+    });
+    await expect(createPlan).resolves.toEqual({ outcome: { outcome: "accepted" } });
+
+    expect(setSessionMode).toHaveBeenCalledWith({ sessionId: "session-1", modeId: "agent" });
+    expect(internals.currentMode).toBe("agent");
+    expect(result).toEqual({
+      followUpPrompt:
+        "The user approved the plan. Implement it now. Do not restate or revise the plan unless blocked.",
+    });
+  });
+
+  test("cursor/create_plan Implement leaves ask mode and returns a followUpPrompt", async () => {
+    const session = createSessionWithConfig({ provider: "cursor", modeId: "ask" });
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const setSessionMode = vi.fn(async () => undefined);
+    const internals = asInternals<{
+      sessionId: string | null;
+      connection: { setSessionMode: typeof setSessionMode };
+      availableModes: Array<{ id: string; label: string }>;
+      currentMode: string | null;
+    }>(session);
+
+    internals.sessionId = "session-1";
+    internals.connection = { setSessionMode };
+    internals.availableModes = [
+      { id: "agent", label: "Agent" },
+      { id: "ask", label: "Ask" },
+    ];
+    internals.currentMode = "ask";
+
+    const createPlan = session.extMethod("cursor/create_plan", {
+      toolCallId: "plan-ask-1",
+      plan: "# From ask",
+      todos: [],
+    });
+    await Promise.resolve();
+
+    const requested = events.find((event) => event.type === "permission_requested");
+    if (requested?.type !== "permission_requested") {
+      throw new Error("Expected permission request");
+    }
+
+    const result = await session.respondToPermission(requested.request.id, {
+      behavior: "allow",
+      selectedActionId: "implement",
+    });
+    await expect(createPlan).resolves.toEqual({ outcome: { outcome: "accepted" } });
+    expect(setSessionMode).toHaveBeenCalledWith({ sessionId: "session-1", modeId: "agent" });
+    expect(internals.currentMode).toBe("agent");
+    expect(result).toEqual({
+      followUpPrompt:
+        "The user approved the plan. Implement it now. Do not restate or revise the plan unless blocked.",
+    });
+  });
+
+  test("cursor/create_plan Reject does not switch mode or return a followUpPrompt", async () => {
+    const session = createSessionWithConfig({ provider: "cursor", modeId: "plan" });
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const setSessionMode = vi.fn(async () => undefined);
+    const internals = asInternals<{
+      sessionId: string | null;
+      connection: { setSessionMode: typeof setSessionMode };
+      availableModes: Array<{ id: string; label: string }>;
+      currentMode: string | null;
+    }>(session);
+
+    internals.sessionId = "session-1";
+    internals.connection = { setSessionMode };
+    internals.availableModes = [
+      { id: "agent", label: "Agent" },
+      { id: "plan", label: "Plan" },
+    ];
+    internals.currentMode = "plan";
+
+    const createPlan = session.extMethod("cursor/create_plan", {
+      toolCallId: "plan-reject-continue",
+      plan: "# Reject me",
+      todos: [],
+    });
+    await Promise.resolve();
+
+    const requested = events.find((event) => event.type === "permission_requested");
+    if (requested?.type !== "permission_requested") {
+      throw new Error("Expected permission request");
+    }
+
+    const result = await session.respondToPermission(requested.request.id, {
+      behavior: "deny",
+      selectedActionId: "reject",
+    });
+    await expect(createPlan).resolves.toEqual({ outcome: { outcome: "rejected" } });
+
+    expect(setSessionMode).not.toHaveBeenCalled();
+    expect(internals.currentMode).toBe("plan");
+    expect(result).toBeUndefined();
+  });
+
+  test("cursor/update_todos omits cancelled todos from the timeline", async () => {
+    const session = createSessionWithConfig({ provider: "cursor" });
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    await session.extMethod("cursor/update_todos", {
+      merge: false,
+      todos: [
+        { id: "1", content: "Active", status: "pending" },
+        { id: "2", content: "Dropped", status: "cancelled" },
+      ],
+    });
+
+    const todoEvent = events.find((event) => event.type === "timeline" && event.item.type === "todo");
+    expect(todoEvent).toMatchObject({
+      item: {
+        type: "todo",
+        items: [{ text: "Active", completed: false }],
+      },
+    });
+  });
+
+  test("cursor/update_todos accepts both extMethod requests and notifications", async () => {
+    const session = createSessionWithConfig({ provider: "cursor" });
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    await expect(
+      session.extMethod("cursor/update_todos", {
+        toolCallId: "todos-1",
+        merge: false,
+        todos: [
+          { id: "1", content: "Set up", status: "completed" },
+          { id: "2", content: "Auth", status: "in_progress" },
+        ],
+      }),
+    ).resolves.toEqual({
+      outcome: {
+        outcome: "accepted",
+        todos: [
+          { id: "1", content: "Set up", status: "completed" },
+          { id: "2", content: "Auth", status: "in_progress" },
+        ],
+      },
+    });
+
+    await session.extNotification("cursor/update_todos", {
+      toolCallId: "todos-2",
+      merge: true,
+      todos: [{ id: "2", content: "Auth", status: "completed" }],
+    });
+
+    const todoEvents = events.filter(
+      (event) => event.type === "timeline" && event.item.type === "todo",
+    );
+    expect(todoEvents).toHaveLength(2);
+    expect(todoEvents[1]).toMatchObject({
+      item: {
+        type: "todo",
+        items: [
+          { text: "Set up", completed: true },
+          { text: "Auth", completed: true },
+        ],
+      },
+    });
+  });
+
+  test("cursor/ask_question maps answers back to Cursor option ids", async () => {
+    const session = createSessionWithConfig({ provider: "cursor" });
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const ask = session.extMethod("cursor/ask_question", {
+      toolCallId: "ask-1",
+      title: "Need input",
+      questions: [
+        {
+          id: "q1",
+          prompt: "Which mode should I use?",
+          options: [
+            { id: "agent", label: "Agent" },
+            { id: "plan", label: "Plan" },
+          ],
+        },
+      ],
+    });
+    await Promise.resolve();
+
+    const requested = events.find((event) => event.type === "permission_requested");
+    expect(requested).toMatchObject({
+      type: "permission_requested",
+      request: {
+        kind: "question",
+        title: "Need input",
+        input: {
+          questions: [
+            {
+              question: "Which mode should I use?",
+              header: "q1",
+              options: [{ label: "Agent" }, { label: "Plan" }],
+              multiSelect: false,
+              allowOther: false,
+            },
+          ],
+        },
+      },
+    });
+    if (requested?.type !== "permission_requested") {
+      throw new Error("Expected permission request");
+    }
+
+    await session.respondToPermission(requested.request.id, {
+      behavior: "allow",
+      updatedInput: { answers: { q1: "Plan" } },
+    });
+
+    await expect(ask).resolves.toEqual({
+      outcome: {
+        outcome: "answered",
+        answers: [{ questionId: "q1", selectedOptionIds: ["plan"] }],
+      },
+    });
+  });
+
+  test("unknown extMethod throws method not found", async () => {
+    const session = createSessionWithConfig({ provider: "cursor" });
+
+    await expect(session.extMethod("cursor/unknown_method", {})).rejects.toMatchObject({
+      code: -32601,
+    });
+  });
+
+  test("maps Create Plan tool_call fallback onto plan detail from rawInput", () => {
+    const session = createSessionWithConfig({ provider: "cursor" });
+    const events = asInternals<ACPSessionInternals>(session).translateSessionUpdate({
+      sessionUpdate: "tool_call",
+      toolCallId: "fallback-plan-1",
+      title: "Create Plan",
+      kind: "other",
+      status: "completed",
+      content: [
+        {
+          type: "content",
+          content: {
+            type: "text",
+            text: "Plan saved to file:///tmp/missing.plan.md",
+          },
+        },
+      ],
+      rawInput: { plan: "# Recovered plan" },
+    });
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "timeline",
+        item: expect.objectContaining({
+          type: "tool_call",
+          callId: "fallback-plan-1",
+          name: "plan_approval",
+          detail: { type: "plan", text: "# Recovered plan" },
+        }),
+      }),
+    );
+  });
+
+  test("maps Create Plan tool_call fallback by reading a .plan.md file", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "paseo-create-plan-"));
+    const planPath = path.join(dir, "ship.plan.md");
+    await writeFile(planPath, "# File plan\n\nDo the thing.\n", "utf8");
+
+    try {
+      const session = createSessionWithConfig({ provider: "cursor" });
+      const events = asInternals<ACPSessionInternals>(session).translateSessionUpdate({
+        sessionUpdate: "tool_call",
+        toolCallId: "fallback-plan-2",
+        title: "Other Create Plan",
+        kind: "other",
+        status: "completed",
+        content: [
+          {
+            type: "content",
+            content: {
+              type: "text",
+              text: `Plan saved to ${pathToFileURL(planPath).href}`,
+            },
+          },
+        ],
+      });
+
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "timeline",
+          item: expect.objectContaining({
+            type: "tool_call",
+            name: "plan_approval",
+            detail: {
+              type: "plan",
+              text: "# File plan\n\nDo the thing.\n",
+            },
+          }),
+        }),
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test("maps the Kiro _kiro.dev/commands/available notification into slash commands and skills", async () => {
     const session = createKiroSession({
       waitForInitialCommands: true,

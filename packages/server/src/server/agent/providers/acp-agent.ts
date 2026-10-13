@@ -1,10 +1,12 @@
 import { ACPProviderOptionsSchema } from "./acp-options.js";
 import { type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
+import { fileURLToPath } from "node:url";
 
 import { terminateWithTreeKill } from "../../../utils/tree-kill.js";
 import type { ProcessTerminator } from "../../../utils/tree-kill.js";
@@ -15,6 +17,7 @@ import type {
 import {
   ClientSideConnection,
   PROTOCOL_VERSION,
+  RequestError,
   type AgentCapabilities as ACPAgentCapabilities,
   type Error as ACPError,
   type AnyMessage,
@@ -70,9 +73,11 @@ import {
   type AgentMetadata,
   type AgentMode,
   type AgentModelDefinition,
+  type AgentPermissionAction,
   type AgentPermissionRequest,
   type AgentPermissionRequestKind,
   type AgentPermissionResponse,
+  type AgentPermissionResult,
   type AgentPersistenceHandle,
   type AgentPromptContentBlock,
   type AgentPromptInput,
@@ -628,13 +633,85 @@ export interface ACPToolSnapshot {
   rawOutput?: unknown;
 }
 
+type PendingPermissionOutcome = RequestPermissionResponse | Record<string, unknown>;
+
 interface PendingPermission {
   request: AgentPermissionRequest;
   options: PermissionOption[];
-  resolve: (response: RequestPermissionResponse) => void;
+  resolve: (response: PendingPermissionOutcome) => void;
   reject: (error: Error) => void;
   turnId: string | null;
+  /**
+   * Maps the UI permission response to the value passed to `resolve`. Used by
+   * Cursor extension methods whose wire outcomes differ from ACP
+   * selected/cancelled permission responses.
+   */
+  mapResponse?: (args: {
+    response: AgentPermissionResponse;
+    selectedOption: PermissionOption | null;
+  }) => PendingPermissionOutcome;
+  planToolCallId?: string;
+  planText?: string;
+  /** Snapshot to restore when a create_plan preview is rejected or cancelled. */
+  previousCursorTodos?: CursorTodo[];
 }
+
+type CursorTodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
+
+interface CursorTodo {
+  id: string;
+  content: string;
+  status: CursorTodoStatus;
+}
+
+interface CursorAskQuestionOption {
+  id: string;
+  label: string;
+}
+
+interface CursorAskQuestion {
+  id: string;
+  prompt: string;
+  options: CursorAskQuestionOption[];
+  allowMultiple?: boolean;
+}
+
+const CURSOR_CREATE_PLAN_OPTIONS: PermissionOption[] = [
+  { optionId: "implement", name: "Implement", kind: "allow_once" },
+  { optionId: "reject", name: "Reject", kind: "reject_once" },
+];
+
+const CURSOR_CREATE_PLAN_ACTIONS: AgentPermissionAction[] = [
+  {
+    id: "reject",
+    label: "Reject",
+    behavior: "deny",
+    variant: "danger",
+    intent: "dismiss",
+  },
+  {
+    id: "implement",
+    label: "Implement",
+    behavior: "allow",
+    variant: "primary",
+    intent: "implement",
+  },
+];
+
+/**
+ * Same start line as Codex plan Implement (`CODEX_PLAN_IMPLEMENTATION_PROMPT_PREFIX`).
+ * Cursor already has the plan in-session from `create_plan`, so we only nudge
+ * execution via `AgentPermissionResult.followUpPrompt` — no plan re-paste.
+ */
+const CURSOR_PLAN_IMPLEMENTATION_PROMPT =
+  "The user approved the plan. Implement it now. Do not restate or revise the plan unless blocked.";
+
+const CURSOR_READ_ONLY_MODES = new Set(["plan", "ask"]);
+
+const CURSOR_ASK_QUESTION_OPTIONS: PermissionOption[] = [
+  { optionId: "answer", name: "Submit", kind: "allow_once" },
+  { optionId: "skip", name: "Skip", kind: "reject_once" },
+];
 
 interface PendingUserMessage {
   text: string;
@@ -1730,6 +1807,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private readonly harnessEnvironment: Record<string, string>;
   private readonly subscribers = new Set<(event: AgentStreamEvent) => void>();
   private readonly pendingPermissions = new Map<string, PendingPermission>();
+  private cursorTodos: CursorTodo[] = [];
   private pendingUserMessage: PendingUserMessage | null = null;
   private submittedUserMessageTurnId: string | null = null;
   private readonly toolCalls = new Map<string, ACPToolSnapshot>();
@@ -2489,7 +2567,10 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     return Array.from(this.pendingPermissions.values(), (entry) => entry.request);
   }
 
-  async respondToPermission(requestId: string, response: AgentPermissionResponse): Promise<void> {
+  async respondToPermission(
+    requestId: string,
+    response: AgentPermissionResponse,
+  ): Promise<AgentPermissionResult | void> {
     const pending = this.pendingPermissions.get(requestId);
     if (!pending) {
       throw new Error(`No pending permission request with id '${requestId}'`);
@@ -2503,16 +2584,32 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     }
 
     this.pendingPermissions.delete(requestId);
-    pending.resolve(
-      selectedOption
-        ? {
-            outcome: {
-              outcome: "selected",
-              optionId: selectedOption.optionId,
-            },
-          }
-        : { outcome: { outcome: "cancelled" } },
-    );
+    this.completePendingPlanTimeline(pending, response.behavior === "allow");
+    if (response.behavior !== "allow") {
+      this.restoreCursorTodosAfterPlanRejection(pending);
+    }
+
+    const isCursorCreatePlanAllow =
+      response.behavior === "allow" && pending.request.name === "cursor/create_plan";
+    if (isCursorCreatePlanAllow) {
+      // Leave plan/ask before resolving so Cursor continues in an executable mode.
+      await this.ensureCursorExecutableModeAfterPlanApproval();
+    }
+
+    let outcome: PendingPermissionOutcome;
+    if (pending.mapResponse) {
+      outcome = pending.mapResponse({ response, selectedOption });
+    } else if (selectedOption) {
+      outcome = {
+        outcome: {
+          outcome: "selected",
+          optionId: selectedOption.optionId,
+        },
+      };
+    } else {
+      outcome = { outcome: { outcome: "cancelled" } };
+    }
+    pending.resolve(outcome);
 
     this.pushEvent({
       type: "permission_resolved",
@@ -2524,6 +2621,12 @@ export class ACPAgentSession implements AgentSession, ACPClient {
 
     if (response.behavior === "deny" && response.interrupt && this.connection && this.sessionId) {
       await this.connection.cancel({ sessionId: this.sessionId });
+    }
+
+    // Codex-style: agent-manager / respondToAgentPermission starts this turn
+    // (with replaceRunning when a plan turn is still in flight).
+    if (isCursorCreatePlanAllow) {
+      return { followUpPrompt: CURSOR_PLAN_IMPLEMENTATION_PROMPT };
     }
   }
 
@@ -2650,7 +2753,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       this.pendingPermissions.set(requestId, {
         request,
         options: params.options,
-        resolve,
+        resolve: (response) => resolve(response as RequestPermissionResponse),
         reject,
         turnId: this.activeForegroundTurnId,
       });
@@ -2713,6 +2816,33 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     }
   }
 
+  async extMethod(
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    this.logger.trace(
+      {
+        agentId: this.agentId,
+        provider: this.provider,
+        sessionId: typeof params.sessionId === "string" ? params.sessionId : undefined,
+        method,
+        rawEvent: params,
+      },
+      "provider.acp.extension_method",
+    );
+
+    switch (method) {
+      case "cursor/create_plan":
+        return this.handleCursorCreatePlan(params);
+      case "cursor/update_todos":
+        return this.handleCursorUpdateTodos(params, { asRequest: true });
+      case "cursor/ask_question":
+        return this.handleCursorAskQuestion(params);
+      default:
+        throw RequestError.methodNotFound(method);
+    }
+  }
+
   async extNotification(method: string, params: Record<string, unknown>): Promise<void> {
     this.logger.trace(
       {
@@ -2724,6 +2854,11 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       },
       "provider.acp.extension_notification",
     );
+
+    if (method === "cursor/update_todos") {
+      this.handleCursorUpdateTodos(params, { asRequest: false });
+      return;
+    }
 
     const parsedCommands = this.extensionCommandsParser?.(method, params);
     if (parsedCommands) {
@@ -3429,11 +3564,258 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.pushEvent(event);
   }
 
+  /**
+   * Plan/ask are read-only. Implement means execute, so switch to agent when
+   * needed (Claude ExitPlanMode → acceptEdits / Codex plan_mode off parallel).
+   */
+  private async ensureCursorExecutableModeAfterPlanApproval(): Promise<void> {
+    if (!this.connection || !this.sessionId) {
+      return;
+    }
+    if (this.currentMode !== null && !CURSOR_READ_ONLY_MODES.has(this.currentMode)) {
+      return;
+    }
+
+    const agentMode =
+      this.availableModes.find((mode) => mode.id === "agent") ??
+      this.availableModes.find(
+        (mode) =>
+          !CURSOR_READ_ONLY_MODES.has(mode.id) &&
+          mode.id !== "debug" &&
+          /agent|default|build/i.test(`${mode.id} ${mode.label}`),
+      );
+    const targetModeId = agentMode?.id ?? "agent";
+    if (this.currentMode === targetModeId) {
+      return;
+    }
+
+    try {
+      await this.setMode(targetModeId);
+    } catch (error) {
+      this.logger.warn(
+        { err: error, targetModeId, currentMode: this.currentMode },
+        "Failed to switch Cursor mode after create_plan Implement",
+      );
+    }
+
+    // setMode may warn-and-return without throwing when the target is missing.
+    if (this.currentMode !== null && CURSOR_READ_ONLY_MODES.has(this.currentMode)) {
+      this.logger.warn(
+        { currentMode: this.currentMode, targetModeId },
+        "Cursor create_plan Implement left session in a read-only mode; follow-up may not execute",
+      );
+    }
+  }
+
   private cancelPendingPermissions(): void {
     for (const pending of this.pendingPermissions.values()) {
+      this.completePendingPlanTimeline(pending, false);
+      this.restoreCursorTodosAfterPlanRejection(pending);
       pending.resolve({ outcome: { outcome: "cancelled" } });
     }
     this.pendingPermissions.clear();
+  }
+
+  private completePendingPlanTimeline(pending: PendingPermission, approved: boolean): void {
+    if (!pending.planToolCallId || pending.planText === undefined) {
+      return;
+    }
+    this.pushEvent(
+      this.wrapTimeline({
+        type: "tool_call",
+        callId: pending.planToolCallId,
+        name: "plan_approval",
+        status: "completed",
+        error: null,
+        detail: { type: "plan", text: pending.planText },
+        metadata: { approved },
+      }),
+    );
+  }
+
+  private restoreCursorTodosAfterPlanRejection(pending: PendingPermission): void {
+    if (!pending.planToolCallId || pending.previousCursorTodos === undefined) {
+      return;
+    }
+    this.applyCursorTodos(pending.previousCursorTodos, false);
+  }
+
+  private async handleCursorCreatePlan(
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const plan = typeof params.plan === "string" ? params.plan : "";
+    const toolCallId =
+      typeof params.toolCallId === "string" && params.toolCallId.trim().length > 0
+        ? params.toolCallId
+        : randomUUID();
+    const name = typeof params.name === "string" ? params.name.trim() : "";
+    const overview = typeof params.overview === "string" ? params.overview.trim() : "";
+    const todos = parseCursorTodos(params.todos);
+    const previousCursorTodos = this.cursorTodos.map((todo) => ({ ...todo }));
+
+    this.pushEvent(
+      this.wrapTimeline({
+        type: "tool_call",
+        callId: toolCallId,
+        name: "plan_approval",
+        status: "running",
+        error: null,
+        detail: { type: "plan", text: plan },
+      }),
+    );
+
+    // Always replace so a plan without todos clears stale preview/previous lists.
+    this.applyCursorTodos(todos, false);
+
+    const requestId = randomUUID();
+    const request: AgentPermissionRequest = {
+      id: requestId,
+      provider: this.provider,
+      name: "cursor/create_plan",
+      kind: "plan",
+      title: name || overview || "Plan",
+      description: overview || undefined,
+      input: { plan, ...(name ? { name } : {}), ...(overview ? { overview } : {}) },
+      detail: { type: "plan", text: plan },
+      actions: CURSOR_CREATE_PLAN_ACTIONS,
+      metadata: {
+        planText: plan,
+        toolCallId,
+        source: "cursor_create_plan",
+      },
+    };
+
+    return await new Promise<Record<string, unknown>>((resolve, reject) => {
+      this.pendingPermissions.set(requestId, {
+        request,
+        options: CURSOR_CREATE_PLAN_OPTIONS,
+        resolve: (response) => resolve(response as Record<string, unknown>),
+        reject,
+        turnId: this.activeForegroundTurnId,
+        planToolCallId: toolCallId,
+        planText: plan,
+        previousCursorTodos,
+        mapResponse: ({ response }) => {
+          if (response.behavior === "allow") {
+            return { outcome: { outcome: "accepted" } };
+          }
+          return {
+            outcome: {
+              outcome: "rejected",
+              ...(response.message ? { reason: response.message } : {}),
+            },
+          };
+        },
+      });
+
+      this.pushEvent({
+        type: "permission_requested",
+        provider: this.provider,
+        request,
+        turnId: this.activeForegroundTurnId ?? undefined,
+      });
+    });
+  }
+
+  private handleCursorUpdateTodos(
+    params: Record<string, unknown>,
+    options: { asRequest: boolean },
+  ): Record<string, unknown> {
+    const todos = parseCursorTodos(params.todos);
+    const merge = params.merge === true;
+    const nextTodos = this.applyCursorTodos(todos, merge);
+    if (options.asRequest) {
+      return { outcome: { outcome: "accepted", todos: nextTodos } };
+    }
+    return {};
+  }
+
+  private applyCursorTodos(todos: CursorTodo[], merge: boolean): CursorTodo[] {
+    if (!merge) {
+      this.cursorTodos = todos;
+    } else {
+      const byId = new Map(this.cursorTodos.map((todo) => [todo.id, todo]));
+      for (const todo of todos) {
+        const previous = byId.get(todo.id);
+        byId.set(todo.id, previous ? { ...previous, ...todo } : todo);
+      }
+      this.cursorTodos = Array.from(byId.values());
+    }
+
+    this.pushEvent(this.wrapTimeline(mapPlanToTimeline(cursorTodosToPlan(this.cursorTodos))));
+    return this.cursorTodos.map((todo) => ({ ...todo }));
+  }
+
+  private async handleCursorAskQuestion(
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const questions = parseCursorAskQuestions(params.questions);
+    if (questions.length === 0) {
+      return { outcome: { outcome: "skipped", reason: "No questions provided" } };
+    }
+
+    const title =
+      typeof params.title === "string" && params.title.trim().length > 0
+        ? params.title.trim()
+        : questions[0]?.prompt;
+    const requestId = randomUUID();
+    const request: AgentPermissionRequest = {
+      id: requestId,
+      provider: this.provider,
+      name: "cursor/ask_question",
+      kind: "question",
+      title,
+      input: {
+        questions: questions.map((question) => ({
+          question: question.prompt,
+          header: question.id,
+          options: question.options.map((option) => ({ label: option.label })),
+          multiSelect: question.allowMultiple === true,
+          allowOther: false,
+        })),
+      },
+      metadata: {
+        toolCallId: typeof params.toolCallId === "string" ? params.toolCallId : undefined,
+        source: "cursor_ask_question",
+        cursorQuestions: questions,
+      },
+    };
+
+    return await new Promise<Record<string, unknown>>((resolve, reject) => {
+      this.pendingPermissions.set(requestId, {
+        request,
+        options: CURSOR_ASK_QUESTION_OPTIONS,
+        resolve: (response) => resolve(response as Record<string, unknown>),
+        reject,
+        turnId: this.activeForegroundTurnId,
+        mapResponse: ({ response }) => {
+          if (response.behavior !== "allow") {
+            return {
+              outcome: {
+                outcome: "skipped",
+                ...(response.message ? { reason: response.message } : {}),
+              },
+            };
+          }
+          return {
+            outcome: {
+              outcome: "answered",
+              answers: mapCursorAskQuestionAnswers(
+                questions,
+                readStringRecord(response.updatedInput?.answers),
+              ),
+            },
+          };
+        },
+      });
+
+      this.pushEvent({
+        type: "permission_requested",
+        provider: this.provider,
+        request,
+        turnId: this.activeForegroundTurnId ?? undefined,
+      });
+    });
   }
 
   private emitBootstrapThreadEvent(): void {
@@ -3767,6 +4149,191 @@ function mapPlanToTimeline(plan: Plan): AgentTimelineItem {
   };
 }
 
+function cursorTodoStatusToPlanEntryStatus(
+  status: CursorTodoStatus,
+): Plan["entries"][number]["status"] {
+  if (status === "completed") {
+    return "completed";
+  }
+  if (status === "in_progress") {
+    return "in_progress";
+  }
+  return "pending";
+}
+
+function cursorTodosToPlan(todos: CursorTodo[]): Plan {
+  return {
+    // Timeline todos only expose completed/open; drop cancelled so they do not
+    // linger as open items after Cursor marks them cancelled.
+    entries: todos
+      .filter((todo) => todo.status !== "cancelled")
+      .map((todo) => ({
+        content: todo.content,
+        priority: "medium",
+        status: cursorTodoStatusToPlanEntryStatus(todo.status),
+      })),
+  };
+}
+
+function parseCursorTodos(value: unknown): CursorTodo[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const todos: CursorTodo[] = [];
+  for (const entry of value) {
+    if (!isRecord(entry)) {
+      continue;
+    }
+    const id = typeof entry.id === "string" ? entry.id.trim() : "";
+    const content = typeof entry.content === "string" ? entry.content.trim() : "";
+    if (!id || !content) {
+      continue;
+    }
+    const status = parseCursorTodoStatus(entry.status);
+    todos.push({ id, content, status });
+  }
+  return todos;
+}
+
+function parseCursorTodoStatus(value: unknown): CursorTodoStatus {
+  switch (value) {
+    case "in_progress":
+    case "completed":
+    case "cancelled":
+      return value;
+    default:
+      return "pending";
+  }
+}
+
+function parseCursorAskQuestions(value: unknown): CursorAskQuestion[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const questions: CursorAskQuestion[] = [];
+  for (const entry of value) {
+    if (!isRecord(entry)) {
+      continue;
+    }
+    const id = typeof entry.id === "string" ? entry.id.trim() : "";
+    const prompt = typeof entry.prompt === "string" ? entry.prompt.trim() : "";
+    if (!id || !prompt || !Array.isArray(entry.options)) {
+      continue;
+    }
+    const options: CursorAskQuestionOption[] = [];
+    for (const option of entry.options) {
+      if (!isRecord(option)) {
+        continue;
+      }
+      const optionId = typeof option.id === "string" ? option.id.trim() : "";
+      const label = typeof option.label === "string" ? option.label.trim() : "";
+      if (!optionId || !label) {
+        continue;
+      }
+      options.push({ id: optionId, label });
+    }
+    if (options.length === 0) {
+      continue;
+    }
+    questions.push({
+      id,
+      prompt,
+      options,
+      ...(entry.allowMultiple === true ? { allowMultiple: true } : {}),
+    });
+  }
+  return questions;
+}
+
+function mapCursorAskQuestionAnswers(
+  questions: CursorAskQuestion[],
+  answers: Record<string, string> | undefined,
+): Array<{ questionId: string; selectedOptionIds: string[] }> {
+  if (!answers) {
+    return questions.map((question) => ({ questionId: question.id, selectedOptionIds: [] }));
+  }
+
+  return questions.map((question) => {
+    const answerText = answers[question.id] ?? answers[question.prompt] ?? "";
+    const labels = answerText
+      .split(",")
+      .map((label) => label.trim())
+      .filter((label) => label.length > 0);
+    const selectedOptionIds: string[] = [];
+    for (const label of labels) {
+      const option = question.options.find((candidate) => candidate.label === label);
+      if (option) {
+        selectedOptionIds.push(option.id);
+      }
+    }
+    return { questionId: question.id, selectedOptionIds };
+  });
+}
+
+function tryMapCreatePlanToolDetail(context: MapToolDetailContext): ToolCallDetail | null {
+  const { snapshot, textContent, rawInput, rawOutput } = context;
+  const title = snapshot.title ?? "";
+  const text = textContent ?? "";
+  const outputText = stringifyUnknown(snapshot.rawOutput) ?? "";
+  const looksLikeCreatePlan =
+    /create\s*plan/i.test(title) ||
+    /\.plan\.md\b/i.test(text) ||
+    /Plan saved to file:\/\//i.test(text) ||
+    /\.plan\.md\b/i.test(outputText) ||
+    /Plan saved to file:\/\//i.test(outputText);
+
+  if (!looksLikeCreatePlan) {
+    return null;
+  }
+
+  const planFromInput = readString(rawInput, ["plan"]);
+  if (planFromInput) {
+    return { type: "plan", text: planFromInput };
+  }
+
+  const planPath =
+    extractPlanFilePath(text) ??
+    extractPlanFilePath(outputText) ??
+    extractPlanFilePath(readString(rawOutput, ["text", "content", "message"]) ?? "");
+  if (planPath) {
+    const content = tryReadPlanFile(planPath);
+    if (content) {
+      return { type: "plan", text: content };
+    }
+    return {
+      type: "read",
+      filePath: planPath,
+    };
+  }
+
+  return null;
+}
+
+function extractPlanFilePath(text: string): string | null {
+  if (!text) {
+    return null;
+  }
+  const fileUri = text.match(/file:\/\/[^\s)"']+\.plan\.md/i)?.[0];
+  if (fileUri) {
+    try {
+      return fileURLToPath(fileUri);
+    } catch {
+      // Fall through to absolute-path matching.
+    }
+  }
+  const absolute = text.match(/(?:^|[\s("'])(\/[\w./+-]+\.plan\.md)\b/i);
+  return absolute?.[1] ?? null;
+}
+
+function tryReadPlanFile(filePath: string): string | null {
+  try {
+    const content = readFileSync(filePath, "utf8");
+    return content.trim().length > 0 ? content : null;
+  } catch {
+    return null;
+  }
+}
+
 function mapToolSnapshotToTimeline(
   snapshot: ACPToolSnapshot,
   terminals: Map<string, TerminalEntry>,
@@ -3776,7 +4343,7 @@ function mapToolSnapshotToTimeline(
   const base = {
     type: "tool_call" as const,
     callId: snapshot.toolCallId,
-    name: snapshot.kind ?? snapshot.title,
+    name: detail.type === "plan" ? "plan_approval" : (snapshot.kind ?? snapshot.title),
     detail,
     metadata: {
       kind: snapshot.kind ?? undefined,
@@ -3840,6 +4407,11 @@ function mapToolDetail(
     rawInput: readRecord(snapshot.rawInput),
     rawOutput: readRecord(snapshot.rawOutput),
   };
+
+  const createPlanDetail = tryMapCreatePlanToolDetail(context);
+  if (createPlanDetail) {
+    return createPlanDetail;
+  }
 
   switch (snapshot.kind) {
     case "read":
@@ -4107,6 +4679,19 @@ function appendTerminalOutput(entry: TerminalEntry, chunk: string): void {
 
 function readRecord(value: unknown): Record<string, unknown> | null {
   return isRecord(value) ? value : null;
+}
+
+function readStringRecord(value: unknown): Record<string, string> | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const result: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === "string") {
+      result[key] = entry;
+    }
+  }
+  return result;
 }
 
 function readString(record: Record<string, unknown> | null, keys: string[]): string | undefined {
