@@ -53,6 +53,20 @@ preferences and selection history. Cursor versions without that extension must b
 still probes model selections in its own shim. The initial session supplies modes and the current
 model; it does not override the model list returned by a resolver.
 
+Cursor also sends blocking ACP extension methods (`cursor/create_plan`, `cursor/ask_question`) and
+todo notifications (`cursor/update_todos`, sometimes as a request). `ACPAgentSession.extMethod`
+handles those: `create_plan` becomes the same `kind: "plan"` permission + `plan_approval` timeline
+item Claude/Codex use for PlanCard, and `update_todos` maps onto the existing ACP plan/todo
+timeline. Without `extMethod`, Cursor falls back to a tool_call titled "Create Plan" with a
+`file://…plan.md` note — `mapToolDetail` remaps that path onto plan detail when it can.
+
+PlanCard **Implement** allows the request (`selectedActionId: implement`) and returns nested
+`{ outcome: { outcome: "accepted" } }`. Accept alone is not enough: Cursor ends the planning
+turn, so Paseo also leaves `plan`/`ask` for `agent` and returns a short Codex-style
+`followUpPrompt` (prefix only — the plan is already in session) that
+`respondToAgentPermission` starts as the next turn. **Reject** denies with nested `rejected`,
+restores prior todos, and does not return a follow-up.
+
 ### Direct
 
 Implement the `AgentClient` and `AgentSession` interfaces from `agent-sdk-types.ts` yourself. This gives full control but requires you to handle process management, streaming, permissions, and session persistence from scratch.
