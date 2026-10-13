@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import type {
@@ -13,6 +13,9 @@ import { respondToAgentPermission } from "./permission-response.js";
 class FakePermissionAgentManager {
   permissionResult: AgentPermissionResult | void;
   hasRunInFlight = false;
+  /** After this many hasInFlightRun checks, report idle. */
+  inFlightUntilChecks = 0;
+  hasInFlightCheckCount = 0;
   outOfBandHandled = false;
   permissionResponses: Array<{
     agentId: string;
@@ -41,6 +44,11 @@ class FakePermissionAgentManager {
   }
 
   hasInFlightRun(): boolean {
+    this.hasInFlightCheckCount += 1;
+    if (this.inFlightUntilChecks > 0) {
+      const stillInFlight = this.hasInFlightCheckCount <= this.inFlightUntilChecks;
+      return stillInFlight;
+    }
     return this.hasRunInFlight;
   }
 
@@ -118,7 +126,7 @@ describe("respondToAgentPermission", () => {
     expect(agentManager.replacementRuns).toEqual([]);
   });
 
-  test("replaces an in-flight run for follow-up prompts", async () => {
+  test("replaces an in-flight run for follow-up prompts by default", async () => {
     const agentManager = new FakePermissionAgentManager();
     agentManager.hasRunInFlight = true;
     agentManager.permissionResult = { followUpPrompt: "continue after approval" };
@@ -138,5 +146,64 @@ describe("respondToAgentPermission", () => {
         prompt: "continue after approval",
       },
     ]);
+  });
+
+  test("waits for idle then starts without replacing when replaceRunning is false", async () => {
+    vi.useFakeTimers();
+    const agentManager = new FakePermissionAgentManager();
+    // First check (before wait loop) and a few polls stay busy, then idle.
+    agentManager.inFlightUntilChecks = 3;
+    agentManager.permissionResult = {
+      followUpPrompt: "implement after CreatePlan settles",
+      replaceRunning: false,
+    };
+
+    const pending = respondToAgentPermission({
+      agentManager,
+      agentId: "agent-1",
+      requestId: "permission-1",
+      response: { behavior: "allow" },
+      logger,
+    });
+
+    await vi.advanceTimersByTimeAsync(200);
+    await pending;
+
+    expect(agentManager.replacementRuns).toEqual([]);
+    expect(agentManager.streamRuns).toEqual([
+      {
+        agentId: "agent-1",
+        prompt: "implement after CreatePlan settles",
+      },
+    ]);
+    expect(agentManager.hasInFlightCheckCount).toBeGreaterThan(3);
+    vi.useRealTimers();
+  });
+
+  test("times out when replaceRunning is false and the turn never settles", async () => {
+    vi.useFakeTimers();
+    const agentManager = new FakePermissionAgentManager();
+    agentManager.hasRunInFlight = true;
+    agentManager.permissionResult = {
+      followUpPrompt: "never starts",
+      replaceRunning: false,
+    };
+
+    const pending = respondToAgentPermission({
+      agentManager,
+      agentId: "agent-1",
+      requestId: "permission-1",
+      response: { behavior: "allow" },
+      logger,
+    });
+    const expectation = expect(pending).rejects.toThrow(
+      /Timed out waiting for agent agent-1 to finish the current turn/,
+    );
+    await vi.advanceTimersByTimeAsync(30_000);
+    await expectation;
+
+    expect(agentManager.streamRuns).toEqual([]);
+    expect(agentManager.replacementRuns).toEqual([]);
+    vi.useRealTimers();
   });
 });

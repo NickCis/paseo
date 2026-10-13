@@ -628,28 +628,35 @@ export interface ACPToolSnapshot {
   rawOutput?: unknown;
 }
 
-type PendingPermissionOutcome = RequestPermissionResponse | Record<string, unknown>;
-
-interface PendingPermission {
+interface PendingPermissionBase {
   request: AgentPermissionRequest;
   options: PermissionOption[];
-  resolve: (response: PendingPermissionOutcome) => void;
   reject: (error: Error) => void;
   turnId: string | null;
-  /**
-   * Maps the UI permission response to the value passed to `resolve`. Used by
-   * Cursor extension methods whose wire outcomes differ from ACP
-   * selected/cancelled permission responses.
-   */
-  mapResponse?: (args: {
-    response: AgentPermissionResponse;
-    selectedOption: PermissionOption | null;
-  }) => PendingPermissionOutcome;
-  planToolCallId?: string;
-  planText?: string;
-  /** Snapshot to restore when a create_plan preview is rejected or cancelled. */
-  previousCursorTodos?: CursorTodo[];
 }
+
+/** Standard ACP `session/request_permission`; resolves with the ACP wire outcome. */
+interface PendingACPPermission extends PendingPermissionBase {
+  kind: "acp";
+  resolve: (response: RequestPermissionResponse) => void;
+}
+
+/** Cursor extension methods; resolve with the Cursor wire outcome. */
+interface PendingCursorPermission extends PendingPermissionBase {
+  kind: "cursor";
+  resolve: (response: Record<string, unknown>) => void;
+  mapResponse: (response: AgentPermissionResponse) => Record<string, unknown>;
+  cursorPlan?: CursorPlanApproval;
+}
+
+interface CursorPlanApproval {
+  toolCallId: string;
+  text: string;
+  /** Todos to restore when this plan preview is rejected or cancelled. */
+  previousTodos: CursorTodo[];
+}
+
+type PendingPermission = PendingACPPermission | PendingCursorPermission;
 
 type CursorTodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
 
@@ -697,9 +704,13 @@ const CURSOR_CREATE_PLAN_ACTIONS: AgentPermissionAction[] = [
  * Same start line as Codex plan Implement (`CODEX_PLAN_IMPLEMENTATION_PROMPT_PREFIX`).
  * Cursor already has the plan in-session from `create_plan`, so we only nudge
  * execution via `AgentPermissionResult.followUpPrompt` — no plan re-paste.
+ * TodoWrite is required: without it Cursor often finishes the work and leaves
+ * plan todos pending forever.
  */
 const CURSOR_PLAN_IMPLEMENTATION_PROMPT =
-  "The user approved the plan. Implement it now. Do not restate or revise the plan unless blocked.";
+  "The user approved the plan. Implement it now. Do not restate or revise the plan unless blocked. " +
+  "As you work, use TodoWrite on the plan todos: set the active step to in_progress, mark each " +
+  "step completed when finished, and leave no plan todos pending when done.";
 
 const CURSOR_READ_ONLY_MODES = new Set(["plan", "ask"]);
 
@@ -2555,33 +2566,32 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       );
     }
 
+    const isCursorPlanApproval =
+      response.behavior === "allow" &&
+      pending.kind === "cursor" &&
+      pending.cursorPlan !== undefined;
+    if (isCursorPlanApproval) {
+      // Leave plan/ask before resolving so Cursor continues in an executable mode. A throw
+      // here keeps the approval pending so the user can retry it.
+      await this.ensureCursorExecutableModeAfterPlanApproval();
+      if (this.pendingPermissions.get(requestId) !== pending) {
+        throw new Error(`No pending permission request with id '${requestId}'`);
+      }
+    }
+
     this.pendingPermissions.delete(requestId);
-    this.completePendingPlanTimeline(pending, response.behavior === "allow");
+    this.completePendingPlanTimeline({ pending, approved: response.behavior === "allow" });
     if (response.behavior !== "allow") {
       this.restoreCursorTodosAfterPlanRejection(pending);
     }
 
-    const isCursorCreatePlanAllow =
-      response.behavior === "allow" && pending.request.name === "cursor/create_plan";
-    if (isCursorCreatePlanAllow) {
-      // Leave plan/ask before resolving so Cursor continues in an executable mode.
-      await this.ensureCursorExecutableModeAfterPlanApproval();
-    }
-
-    let outcome: PendingPermissionOutcome;
-    if (pending.mapResponse) {
-      outcome = pending.mapResponse({ response, selectedOption });
+    if (pending.kind === "cursor") {
+      pending.resolve(pending.mapResponse(response));
     } else if (selectedOption) {
-      outcome = {
-        outcome: {
-          outcome: "selected",
-          optionId: selectedOption.optionId,
-        },
-      };
+      pending.resolve({ outcome: { outcome: "selected", optionId: selectedOption.optionId } });
     } else {
-      outcome = { outcome: { outcome: "cancelled" } };
+      pending.resolve({ outcome: { outcome: "cancelled" } });
     }
-    pending.resolve(outcome);
 
     this.pushEvent({
       type: "permission_resolved",
@@ -2595,10 +2605,13 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       await this.connection.cancel({ sessionId: this.sessionId });
     }
 
-    // Codex-style: agent-manager / respondToAgentPermission starts this turn
-    // (with replaceRunning when a plan turn is still in flight).
-    if (isCursorCreatePlanAllow) {
-      return { followUpPrompt: CURSOR_PLAN_IMPLEMENTATION_PROMPT };
+    // Cursor CreatePlan must settle as accepted before the implement turn starts.
+    // replaceRunning: false waits for that planning turn to end instead of canceling it.
+    if (isCursorPlanApproval) {
+      return {
+        followUpPrompt: CURSOR_PLAN_IMPLEMENTATION_PROMPT,
+        replaceRunning: false,
+      };
     }
   }
 
@@ -2712,9 +2725,10 @@ export class ACPAgentSession implements AgentSession, ACPClient {
 
     const promise = new Promise<RequestPermissionResponse>((resolve, reject) => {
       this.pendingPermissions.set(requestId, {
+        kind: "acp",
         request,
         options: params.options,
-        resolve: (response) => resolve(response as RequestPermissionResponse),
+        resolve,
         reject,
         turnId: this.activeForegroundTurnId,
       });
@@ -3301,7 +3315,30 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       snapshot = this.toolSnapshotTransformer(snapshot);
     }
     this.toolCalls.set(toolCallId, snapshot);
-    return [this.wrapTimeline(mapToolSnapshotToTimeline(snapshot, this.terminalEntries))];
+    const events: AgentStreamEvent[] = [
+      this.wrapTimeline(mapToolSnapshotToTimeline(snapshot, this.terminalEntries)),
+    ];
+    const todoEvent = this.timelineEventFromCursorTodoWrite(snapshot);
+    if (todoEvent) {
+      events.push(todoEvent);
+    }
+    return events;
+  }
+
+  /** Cursor agent-mode TodoWrite updates the same checklist create_plan seeded. */
+  private timelineEventFromCursorTodoWrite(snapshot: ACPToolSnapshot): AgentStreamEvent | null {
+    if (!isCursorTodoWriteTool(snapshot)) {
+      return null;
+    }
+    const rawInput = readRecord(snapshot.rawInput);
+    if (!rawInput || !Array.isArray(rawInput.todos)) {
+      return null;
+    }
+    this.setCursorTodos({
+      todos: parseCursorTodos(rawInput.todos),
+      merge: rawInput.merge === true,
+    });
+    return this.wrapTimeline(mapPlanToTimeline(cursorTodosToPlan(this.cursorTodos)));
   }
 
   private createMessageTimelineItem(
@@ -3524,11 +3561,9 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   /**
    * Plan/ask are read-only. Implement means execute, so switch to agent when
    * needed (Claude ExitPlanMode → acceptEdits / Codex plan_mode off parallel).
+   * Throws when Cursor stays read-only, so the caller can keep the approval pending.
    */
   private async ensureCursorExecutableModeAfterPlanApproval(): Promise<void> {
-    if (!this.connection || !this.sessionId) {
-      return;
-    }
     if (this.currentMode !== null && !CURSOR_READ_ONLY_MODES.has(this.currentMode)) {
       return;
     }
@@ -3546,55 +3581,52 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       return;
     }
 
-    try {
-      await this.setMode(targetModeId);
-    } catch (error) {
-      this.logger.warn(
-        { err: error, targetModeId, currentMode: this.currentMode },
-        "Failed to switch Cursor mode after create_plan Implement",
-      );
-    }
-
-    // setMode may warn-and-return without throwing when the target is missing.
+    // setMode returns without throwing when the target mode is not offered.
+    await this.setMode(targetModeId);
     if (this.currentMode !== null && CURSOR_READ_ONLY_MODES.has(this.currentMode)) {
-      this.logger.warn(
-        { currentMode: this.currentMode, targetModeId },
-        "Cursor create_plan Implement left session in a read-only mode; follow-up may not execute",
+      throw new Error(
+        `Cursor is still in ${this.currentMode} mode, so the approved plan cannot be implemented`,
       );
     }
   }
 
   private cancelPendingPermissions(): void {
     for (const pending of this.pendingPermissions.values()) {
-      this.completePendingPlanTimeline(pending, false);
+      this.completePendingPlanTimeline({ pending, approved: false });
       this.restoreCursorTodosAfterPlanRejection(pending);
       pending.resolve({ outcome: { outcome: "cancelled" } });
     }
     this.pendingPermissions.clear();
   }
 
-  private completePendingPlanTimeline(pending: PendingPermission, approved: boolean): void {
-    if (!pending.planToolCallId || pending.planText === undefined) {
+  private completePendingPlanTimeline({
+    pending,
+    approved,
+  }: {
+    pending: PendingPermission;
+    approved: boolean;
+  }): void {
+    if (pending.kind !== "cursor" || !pending.cursorPlan) {
       return;
     }
     this.pushEvent(
       this.wrapTimeline({
         type: "tool_call",
-        callId: pending.planToolCallId,
+        callId: pending.cursorPlan.toolCallId,
         name: "plan_approval",
         status: "completed",
         error: null,
-        detail: { type: "plan", text: pending.planText },
+        detail: { type: "plan", text: pending.cursorPlan.text },
         metadata: { approved },
       }),
     );
   }
 
   private restoreCursorTodosAfterPlanRejection(pending: PendingPermission): void {
-    if (!pending.planToolCallId || pending.previousCursorTodos === undefined) {
+    if (pending.kind !== "cursor" || !pending.cursorPlan) {
       return;
     }
-    this.applyCursorTodos(pending.previousCursorTodos, false);
+    this.applyCursorTodos({ todos: pending.cursorPlan.previousTodos, merge: false });
   }
 
   private async handleCursorCreatePlan(
@@ -3622,7 +3654,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     );
 
     // Always replace so a plan without todos clears stale preview/previous lists.
-    this.applyCursorTodos(todos, false);
+    this.applyCursorTodos({ todos, merge: false });
 
     const requestId = randomUUID();
     const request: AgentPermissionRequest = {
@@ -3644,15 +3676,14 @@ export class ACPAgentSession implements AgentSession, ACPClient {
 
     return await new Promise<Record<string, unknown>>((resolve, reject) => {
       this.pendingPermissions.set(requestId, {
+        kind: "cursor",
         request,
         options: CURSOR_CREATE_PLAN_OPTIONS,
-        resolve: (response) => resolve(response as Record<string, unknown>),
+        resolve,
         reject,
         turnId: this.activeForegroundTurnId,
-        planToolCallId: toolCallId,
-        planText: plan,
-        previousCursorTodos,
-        mapResponse: ({ response }) => {
+        cursorPlan: { toolCallId, text: plan, previousTodos: previousCursorTodos },
+        mapResponse: (response) => {
           if (response.behavior === "allow") {
             return { outcome: { outcome: "accepted" } };
           }
@@ -3680,27 +3711,36 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   ): Record<string, unknown> {
     const todos = parseCursorTodos(params.todos);
     const merge = params.merge === true;
-    const nextTodos = this.applyCursorTodos(todos, merge);
+    const nextTodos = this.applyCursorTodos({ todos, merge });
     if (options.asRequest) {
       return { outcome: { outcome: "accepted", todos: nextTodos } };
     }
     return {};
   }
 
-  private applyCursorTodos(todos: CursorTodo[], merge: boolean): CursorTodo[] {
-    if (!merge) {
-      this.cursorTodos = todos;
-    } else {
-      const byId = new Map(this.cursorTodos.map((todo) => [todo.id, todo]));
-      for (const todo of todos) {
-        const previous = byId.get(todo.id);
-        byId.set(todo.id, previous ? { ...previous, ...todo } : todo);
-      }
-      this.cursorTodos = Array.from(byId.values());
-    }
-
+  private applyCursorTodos({
+    todos,
+    merge,
+  }: {
+    todos: CursorTodo[];
+    merge: boolean;
+  }): CursorTodo[] {
+    this.setCursorTodos({ todos, merge });
     this.pushEvent(this.wrapTimeline(mapPlanToTimeline(cursorTodosToPlan(this.cursorTodos))));
     return this.cursorTodos.map((todo) => ({ ...todo }));
+  }
+
+  private setCursorTodos({ todos, merge }: { todos: CursorTodo[]; merge: boolean }): void {
+    if (!merge) {
+      this.cursorTodos = todos;
+      return;
+    }
+    const byId = new Map(this.cursorTodos.map((todo) => [todo.id, todo]));
+    for (const todo of todos) {
+      const previous = byId.get(todo.id);
+      byId.set(todo.id, previous ? { ...previous, ...todo } : todo);
+    }
+    this.cursorTodos = Array.from(byId.values());
   }
 
   private async handleCursorAskQuestion(
@@ -3740,12 +3780,13 @@ export class ACPAgentSession implements AgentSession, ACPClient {
 
     return await new Promise<Record<string, unknown>>((resolve, reject) => {
       this.pendingPermissions.set(requestId, {
+        kind: "cursor",
         request,
         options: CURSOR_ASK_QUESTION_OPTIONS,
-        resolve: (response) => resolve(response as Record<string, unknown>),
+        resolve,
         reject,
         turnId: this.activeForegroundTurnId,
-        mapResponse: ({ response }) => {
+        mapResponse: (response) => {
           if (response.behavior !== "allow") {
             return {
               outcome: {
@@ -4202,6 +4243,11 @@ function parseCursorAskQuestions(value: unknown): CursorAskQuestion[] {
   return questions;
 }
 
+function isCursorTodoWriteTool(snapshot: ACPToolSnapshot): boolean {
+  const title = snapshot.title?.trim() ?? "";
+  return /^todo\s*write$/i.test(title) || /^update\s*todos$/i.test(title);
+}
+
 function mapCursorAskQuestionAnswers(
   questions: CursorAskQuestion[],
   answers: Record<string, string> | undefined,
@@ -4211,35 +4257,67 @@ function mapCursorAskQuestionAnswers(
   }
 
   return questions.map((question) => {
-    const answerText = answers[question.id] ?? answers[question.prompt] ?? "";
-    const labels = answerText
-      .split(",")
-      .map((label) => label.trim())
-      .filter((label) => label.length > 0);
-    const selectedOptionIds: string[] = [];
-    for (const label of labels) {
-      const option = question.options.find((candidate) => candidate.label === label);
-      if (option) {
-        selectedOptionIds.push(option.id);
+    const answerText = (answers[question.id] ?? answers[question.prompt] ?? "").trim();
+    return {
+      questionId: question.id,
+      selectedOptionIds: selectedCursorOptionIds(question, answerText),
+    };
+  });
+}
+
+function selectedCursorOptionIds(question: CursorAskQuestion, answerText: string): string[] {
+  if (!answerText) {
+    return [];
+  }
+  // The app sends the chosen label verbatim, and labels may contain commas.
+  const exact = question.options.find((option) => option.label === answerText);
+  if (exact) {
+    return [exact.id];
+  }
+  if (!question.allowMultiple) {
+    return [];
+  }
+  // Multi-select joins labels with ", ". Recover by longest-prefix match against known labels
+  // so a label like "Deploy, then test" is not split apart.
+  return parseJoinedCursorOptionLabels(answerText, question.options);
+}
+
+function parseJoinedCursorOptionLabels(
+  answerText: string,
+  options: CursorAskQuestionOption[],
+): string[] {
+  const selectedOptionIds: string[] = [];
+  let remaining = answerText;
+  while (remaining.length > 0) {
+    let best: CursorAskQuestionOption | null = null;
+    for (const option of options) {
+      if (!remaining.startsWith(option.label)) {
+        continue;
+      }
+      if (!best || option.label.length > best.label.length) {
+        best = option;
       }
     }
-    return { questionId: question.id, selectedOptionIds };
-  });
+    if (!best) {
+      return [];
+    }
+    selectedOptionIds.push(best.id);
+    remaining = remaining.slice(best.label.length);
+    if (remaining.length === 0) {
+      break;
+    }
+    if (!remaining.startsWith(", ")) {
+      return [];
+    }
+    remaining = remaining.slice(2);
+  }
+  return selectedOptionIds;
 }
 
 function tryMapCreatePlanToolDetail(context: MapToolDetailContext): ToolCallDetail | null {
   const { snapshot, textContent, rawInput, rawOutput } = context;
-  const title = snapshot.title ?? "";
-  const text = textContent ?? "";
-  const outputText = stringifyUnknown(snapshot.rawOutput) ?? "";
-  const looksLikeCreatePlan =
-    /create\s*plan/i.test(title) ||
-    /\.plan\.md\b/i.test(text) ||
-    /Plan saved to file:\/\//i.test(text) ||
-    /\.plan\.md\b/i.test(outputText) ||
-    /Plan saved to file:\/\//i.test(outputText);
-
-  if (!looksLikeCreatePlan) {
+  // Only Cursor's own "Create Plan" tool calls. Failed calls keep the normal error display.
+  if (!/create\s*plan/i.test(snapshot.title ?? "") || snapshot.status === "failed") {
     return null;
   }
 
@@ -4248,22 +4326,28 @@ function tryMapCreatePlanToolDetail(context: MapToolDetailContext): ToolCallDeta
     return { type: "plan", text: planFromInput };
   }
 
+  const outputText = stringifyUnknown(snapshot.rawOutput) ?? "";
   const planPath =
-    extractPlanFilePath(text) ??
+    extractPlanFilePath(textContent ?? "") ??
     extractPlanFilePath(outputText) ??
     extractPlanFilePath(readString(rawOutput, ["text", "content", "message"]) ?? "");
-  if (planPath) {
-    const content = tryReadPlanFile(planPath);
-    if (content) {
-      return { type: "plan", text: content };
-    }
-    return {
-      type: "read",
-      filePath: planPath,
-    };
+  if (!planPath) {
+    return null;
   }
 
-  return null;
+  const planFile = readPlanFile(planPath);
+  switch (planFile.status) {
+    case "text":
+      return { type: "plan", text: planFile.text };
+    case "absent":
+      return { type: "read", filePath: planPath };
+    case "error":
+      return {
+        type: "plain_text",
+        label: "Plan",
+        text: `Could not read plan file ${planPath}: ${planFile.message}`,
+      };
+  }
 }
 
 function extractPlanFilePath(text: string): string | null {
@@ -4282,12 +4366,20 @@ function extractPlanFilePath(text: string): string | null {
   return absolute?.[1] ?? null;
 }
 
-function tryReadPlanFile(filePath: string): string | null {
+type PlanFileRead =
+  | { status: "text"; text: string }
+  | { status: "absent" }
+  | { status: "error"; message: string };
+
+function readPlanFile(filePath: string): PlanFileRead {
   try {
     const content = readFileSync(filePath, "utf8");
-    return content.trim().length > 0 ? content : null;
-  } catch {
-    return null;
+    return content.trim().length > 0 ? { status: "text", text: content } : { status: "absent" };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { status: "absent" };
+    }
+    return { status: "error", message: error instanceof Error ? error.message : String(error) };
   }
 }
 
