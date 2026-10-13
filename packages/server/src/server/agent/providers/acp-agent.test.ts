@@ -1,6 +1,6 @@
 import { type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -2704,7 +2704,7 @@ describe("ACPAgentSession", () => {
   });
 
   test("cursor/create_plan emits a plan permission and returns nested accepted on allow", async () => {
-    const session = createSessionWithConfig({ provider: "cursor" });
+    const session = createSessionWithConfig({ provider: "cursor", modeId: "agent" });
     const events: AgentStreamEvent[] = [];
     asInternals<ACPSessionInternals>(session).sessionId = "session-1";
     session.subscribe((event) => events.push(event));
@@ -2777,7 +2777,10 @@ describe("ACPAgentSession", () => {
     });
     expect(implementResult).toEqual({
       followUpPrompt:
-        "The user approved the plan. Implement it now. Do not restate or revise the plan unless blocked.",
+        "The user approved the plan. Implement it now. Do not restate or revise the plan unless blocked. " +
+        "As you work, use TodoWrite on the plan todos: set the active step to in_progress, mark each " +
+        "step completed when finished, and leave no plan todos pending when done.",
+      replaceRunning: false,
     });
 
     const completedPlan = events.find(
@@ -2840,7 +2843,7 @@ describe("ACPAgentSession", () => {
   });
 
   test("cursor/create_plan with empty todos clears the previous todo preview", async () => {
-    const session = createSessionWithConfig({ provider: "cursor" });
+    const session = createSessionWithConfig({ provider: "cursor", modeId: "agent" });
     const events: AgentStreamEvent[] = [];
     session.subscribe((event) => events.push(event));
 
@@ -2874,7 +2877,10 @@ describe("ACPAgentSession", () => {
     await expect(createPlan).resolves.toEqual({ outcome: { outcome: "accepted" } });
     expect(emptyPlanResult).toEqual({
       followUpPrompt:
-        "The user approved the plan. Implement it now. Do not restate or revise the plan unless blocked.",
+        "The user approved the plan. Implement it now. Do not restate or revise the plan unless blocked. " +
+        "As you work, use TodoWrite on the plan todos: set the active step to in_progress, mark each " +
+        "step completed when finished, and leave no plan todos pending when done.",
+      replaceRunning: false,
     });
   });
 
@@ -2921,7 +2927,10 @@ describe("ACPAgentSession", () => {
     expect(internals.currentMode).toBe("agent");
     expect(result).toEqual({
       followUpPrompt:
-        "The user approved the plan. Implement it now. Do not restate or revise the plan unless blocked.",
+        "The user approved the plan. Implement it now. Do not restate or revise the plan unless blocked. " +
+        "As you work, use TodoWrite on the plan todos: set the active step to in_progress, mark each " +
+        "step completed when finished, and leave no plan todos pending when done.",
+      replaceRunning: false,
     });
   });
 
@@ -2967,7 +2976,10 @@ describe("ACPAgentSession", () => {
     expect(internals.currentMode).toBe("agent");
     expect(result).toEqual({
       followUpPrompt:
-        "The user approved the plan. Implement it now. Do not restate or revise the plan unless blocked.",
+        "The user approved the plan. Implement it now. Do not restate or revise the plan unless blocked. " +
+        "As you work, use TodoWrite on the plan todos: set the active step to in_progress, mark each " +
+        "step completed when finished, and leave no plan todos pending when done.",
+      replaceRunning: false,
     });
   });
 
@@ -3015,6 +3027,67 @@ describe("ACPAgentSession", () => {
     expect(result).toBeUndefined();
   });
 
+  test("cursor/create_plan Implement stays pending when Cursor cannot leave plan mode, then retries", async () => {
+    const session = createSessionWithConfig({ provider: "cursor", modeId: "plan" });
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const setSessionMode = vi
+      .fn(async (_params: { sessionId: string; modeId: string }) => undefined)
+      .mockRejectedValueOnce(new Error("mode switch failed"));
+    const internals = asInternals<{
+      sessionId: string | null;
+      connection: { setSessionMode: typeof setSessionMode };
+      availableModes: Array<{ id: string; label: string }>;
+      currentMode: string | null;
+    }>(session);
+    internals.sessionId = "session-1";
+    internals.connection = { setSessionMode };
+    internals.availableModes = [
+      { id: "agent", label: "Agent" },
+      { id: "plan", label: "Plan" },
+    ];
+    internals.currentMode = "plan";
+
+    const createPlan = session.extMethod("cursor/create_plan", {
+      toolCallId: "plan-retry-1",
+      plan: "# Retry me",
+      todos: [],
+    });
+    await Promise.resolve();
+
+    const requested = events.find((event) => event.type === "permission_requested");
+    if (requested?.type !== "permission_requested") {
+      throw new Error("Expected permission request");
+    }
+
+    await expect(
+      session.respondToPermission(requested.request.id, {
+        behavior: "allow",
+        selectedActionId: "implement",
+      }),
+    ).rejects.toThrow("mode switch failed");
+    expect(session.getPendingPermissions().map((request) => request.id)).toEqual([
+      requested.request.id,
+    ]);
+    expect(events.some((event) => event.type === "permission_resolved")).toBe(false);
+
+    const result = await session.respondToPermission(requested.request.id, {
+      behavior: "allow",
+      selectedActionId: "implement",
+    });
+
+    await expect(createPlan).resolves.toEqual({ outcome: { outcome: "accepted" } });
+    expect(internals.currentMode).toBe("agent");
+    expect(result).toEqual({
+      followUpPrompt:
+        "The user approved the plan. Implement it now. Do not restate or revise the plan unless blocked. " +
+        "As you work, use TodoWrite on the plan todos: set the active step to in_progress, mark each " +
+        "step completed when finished, and leave no plan todos pending when done.",
+      replaceRunning: false,
+    });
+  });
+
   test("cursor/update_todos omits cancelled todos from the timeline", async () => {
     const session = createSessionWithConfig({ provider: "cursor" });
     const events: AgentStreamEvent[] = [];
@@ -3028,7 +3101,9 @@ describe("ACPAgentSession", () => {
       ],
     });
 
-    const todoEvent = events.find((event) => event.type === "timeline" && event.item.type === "todo");
+    const todoEvent = events.find(
+      (event) => event.type === "timeline" && event.item.type === "todo",
+    );
     expect(todoEvent).toMatchObject({
       item: {
         type: "todo",
@@ -3080,6 +3155,39 @@ describe("ACPAgentSession", () => {
         ],
       },
     });
+  });
+
+  test("maps Cursor TodoWrite tool calls onto the plan todo timeline", () => {
+    const session = createSessionWithConfig({ provider: "cursor" });
+    const events = asInternals<ACPSessionInternals>(session).translateSessionUpdate({
+      sessionUpdate: "tool_call",
+      toolCallId: "todo-write-1",
+      title: "TodoWrite",
+      kind: "other",
+      status: "completed",
+      rawInput: {
+        merge: false,
+        todos: [
+          { id: "generate-names", content: "Generate names", status: "completed" },
+          { id: "create-files", content: "Create files", status: "in_progress" },
+          { id: "verify", content: "Verify", status: "pending" },
+        ],
+      },
+    });
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "timeline",
+        item: expect.objectContaining({
+          type: "todo",
+          items: [
+            { text: "Generate names", completed: true },
+            { text: "Create files", completed: false },
+            { text: "Verify", completed: false },
+          ],
+        }),
+      }),
+    );
   });
 
   test("cursor/ask_question maps answers back to Cursor option ids", async () => {
@@ -3135,6 +3243,92 @@ describe("ACPAgentSession", () => {
       outcome: {
         outcome: "answered",
         answers: [{ questionId: "q1", selectedOptionIds: ["plan"] }],
+      },
+    });
+  });
+
+  test("cursor/ask_question keeps a single-choice label that contains a comma", async () => {
+    const session = createSessionWithConfig({ provider: "cursor" });
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const ask = session.extMethod("cursor/ask_question", {
+      toolCallId: "ask-comma",
+      questions: [
+        {
+          id: "q1",
+          prompt: "How should I ship?",
+          options: [
+            { id: "deploy-test", label: "Deploy, then test" },
+            { id: "test-only", label: "Test only" },
+          ],
+        },
+      ],
+    });
+    await Promise.resolve();
+
+    const requested = events.find((event) => event.type === "permission_requested");
+    if (requested?.type !== "permission_requested") {
+      throw new Error("Expected permission request");
+    }
+
+    await session.respondToPermission(requested.request.id, {
+      behavior: "allow",
+      updatedInput: { answers: { q1: "Deploy, then test" } },
+    });
+
+    await expect(ask).resolves.toEqual({
+      outcome: {
+        outcome: "answered",
+        answers: [{ questionId: "q1", selectedOptionIds: ["deploy-test"] }],
+      },
+    });
+  });
+
+  test("cursor/ask_question recovers multi-select labels that contain commas", async () => {
+    const session = createSessionWithConfig({ provider: "cursor" });
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const ask = session.extMethod("cursor/ask_question", {
+      toolCallId: "ask-multi-comma",
+      questions: [
+        {
+          id: "q1",
+          prompt: "How should I ship?",
+          allowMultiple: true,
+          options: [
+            { id: "deploy-test", label: "Deploy, then test" },
+            { id: "test-only", label: "Test only" },
+            { id: "rollback", label: "Rollback, then retry" },
+          ],
+        },
+      ],
+    });
+    await Promise.resolve();
+
+    const requested = events.find((event) => event.type === "permission_requested");
+    if (requested?.type !== "permission_requested") {
+      throw new Error("Expected permission request");
+    }
+
+    await session.respondToPermission(requested.request.id, {
+      behavior: "allow",
+      // Same shape the app emits: labels joined with ", ".
+      updatedInput: {
+        answers: { q1: "Deploy, then test, Test only, Rollback, then retry" },
+      },
+    });
+
+    await expect(ask).resolves.toEqual({
+      outcome: {
+        outcome: "answered",
+        answers: [
+          {
+            questionId: "q1",
+            selectedOptionIds: ["deploy-test", "test-only", "rollback"],
+          },
+        ],
       },
     });
   });
@@ -3213,6 +3407,112 @@ describe("ACPAgentSession", () => {
             detail: {
               type: "plan",
               text: "# File plan\n\nDo the thing.\n",
+            },
+          }),
+        }),
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("leaves a non-plan tool that prints a plan path as its normal tool call", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "paseo-create-plan-"));
+    const planPath = path.join(dir, "ship.plan.md");
+    await writeFile(planPath, "# Not a plan card\n", "utf8");
+
+    try {
+      const session = createSessionWithConfig({ provider: "cursor" });
+      const events = asInternals<ACPSessionInternals>(session).translateSessionUpdate({
+        sessionUpdate: "tool_call",
+        toolCallId: "search-plan-1",
+        title: "Search files",
+        kind: "search",
+        status: "completed",
+        content: [{ type: "content", content: { type: "text", text: `Found ${planPath}` } }],
+      });
+
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "timeline",
+          item: expect.objectContaining({
+            type: "tool_call",
+            callId: "search-plan-1",
+            name: "search",
+          }),
+        }),
+      );
+      expect(events).not.toContainEqual(
+        expect.objectContaining({
+          item: expect.objectContaining({ name: "plan_approval" }),
+        }),
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps a failed Create Plan tool call on the normal error display", () => {
+    const session = createSessionWithConfig({ provider: "cursor" });
+    const events = asInternals<ACPSessionInternals>(session).translateSessionUpdate({
+      sessionUpdate: "tool_call",
+      toolCallId: "failed-plan-1",
+      title: "Create Plan",
+      kind: "other",
+      status: "failed",
+      content: [{ type: "content", content: { type: "text", text: "Disk full" } }],
+      rawInput: { plan: "# Not approved" },
+    });
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "timeline",
+        item: expect.objectContaining({
+          type: "tool_call",
+          callId: "failed-plan-1",
+          status: "failed",
+        }),
+      }),
+    );
+    expect(events).not.toContainEqual(
+      expect.objectContaining({
+        item: expect.objectContaining({ name: "plan_approval" }),
+      }),
+    );
+  });
+
+  test("shows the read error when a Create Plan file cannot be read", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "paseo-create-plan-"));
+    // A directory where the plan file should be: reading it fails with EISDIR, not ENOENT.
+    const planPath = path.join(dir, "broken.plan.md");
+    await mkdir(planPath);
+
+    try {
+      const session = createSessionWithConfig({ provider: "cursor" });
+      const events = asInternals<ACPSessionInternals>(session).translateSessionUpdate({
+        sessionUpdate: "tool_call",
+        toolCallId: "fallback-plan-3",
+        title: "Create Plan",
+        kind: "other",
+        status: "completed",
+        content: [
+          {
+            type: "content",
+            content: { type: "text", text: `Plan saved to ${pathToFileURL(planPath).href}` },
+          },
+        ],
+      });
+
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "timeline",
+          item: expect.objectContaining({
+            type: "tool_call",
+            callId: "fallback-plan-3",
+            detail: {
+              type: "plain_text",
+              label: "Plan",
+              text: expect.stringContaining(`Could not read plan file ${planPath}`),
             },
           }),
         }),
