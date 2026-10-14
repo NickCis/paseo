@@ -102,7 +102,7 @@ interface ACPSessionInternals {
   connection: { prompt: (...args: unknown[]) => Promise<PromptResponse> };
   activeForegroundTurnId: string | null;
   configOptions: SessionConfigOption[];
-  translateSessionUpdate(update: SessionUpdate): AgentStreamEvent[];
+  translateSessionUpdate(update: SessionUpdate): Promise<AgentStreamEvent[]>;
   acpMcpServers(): unknown[];
 }
 
@@ -1066,7 +1066,7 @@ describe("ACPAgentSession Zed parity", () => {
       modelId: "sonnet",
     });
 
-    const modeEvents = asInternals<ACPSessionInternals>(validSession).translateSessionUpdate({
+    const modeEvents = await asInternals<ACPSessionInternals>(validSession).translateSessionUpdate({
       sessionUpdate: "current_mode_update",
       currentModeId: "default",
     });
@@ -1158,7 +1158,7 @@ describe("ACPAgentSession Zed parity", () => {
     const session = createSession();
     const internals = asInternals<ACPSessionInternals>(session);
 
-    const events = internals.translateSessionUpdate({
+    const events = await internals.translateSessionUpdate({
       sessionUpdate: "config_option_update",
       configOptions: [
         selectConfigOption("mode", ["default", "plan"], "plan"),
@@ -1213,11 +1213,11 @@ describe("ACPAgentSession Zed parity", () => {
     const session = createSession();
     const internals = asInternals<ACPSessionInternals>(session);
 
-    internals.translateSessionUpdate({
+    await internals.translateSessionUpdate({
       sessionUpdate: "current_mode_update",
       currentModeId: "plan",
     });
-    const events = internals.translateSessionUpdate({
+    const events = await internals.translateSessionUpdate({
       sessionUpdate: "config_option_update",
       configOptions: [selectConfigOption("model", ["sonnet"], "sonnet")],
     });
@@ -1234,11 +1234,11 @@ describe("ACPAgentSession Zed parity", () => {
     const session = createSession();
     const internals = asInternals<ACPSessionInternals>(session);
 
-    const configEvents = internals.translateSessionUpdate({
+    const configEvents = await internals.translateSessionUpdate({
       sessionUpdate: "config_option_update",
       configOptions: [selectConfigOption("mode", ["default", "plan"], "plan")],
     });
-    const modeEvents = internals.translateSessionUpdate({
+    const modeEvents = await internals.translateSessionUpdate({
       sessionUpdate: "current_mode_update",
       currentModeId: "default",
     });
@@ -1739,7 +1739,7 @@ describe("ACPAgentSession Zed parity", () => {
     const session = createCopilotSessionWithConfig();
     const internals = asInternals<ACPSessionInternals>(session);
 
-    const events = internals.translateSessionUpdate({
+    const events = await internals.translateSessionUpdate({
       sessionUpdate: "config_option_update",
       configOptions: [
         copilotModeConfigOption("https://agentclientprotocol.com/protocol/session-modes#agent"),
@@ -2590,7 +2590,7 @@ describe("ACPAgentSession slash commands", () => {
 
     const listCommandsPromise = session.listCommands();
 
-    asInternals<ACPSessionInternals>(session).translateSessionUpdate({
+    await asInternals<ACPSessionInternals>(session).translateSessionUpdate({
       sessionUpdate: "available_commands_update",
       availableCommands: [
         {
@@ -3157,9 +3157,9 @@ describe("ACPAgentSession", () => {
     });
   });
 
-  test("maps Cursor TodoWrite tool calls onto the plan todo timeline", () => {
+  test("maps Cursor TodoWrite tool calls onto the plan todo timeline", async () => {
     const session = createSessionWithConfig({ provider: "cursor" });
-    const events = asInternals<ACPSessionInternals>(session).translateSessionUpdate({
+    const events = await asInternals<ACPSessionInternals>(session).translateSessionUpdate({
       sessionUpdate: "tool_call",
       toolCallId: "todo-write-1",
       title: "TodoWrite",
@@ -3185,6 +3185,62 @@ describe("ACPAgentSession", () => {
             { text: "Create files", completed: false },
             { text: "Verify", completed: false },
           ],
+        }),
+      }),
+    );
+  });
+
+  test("does not update the plan checklist when Cursor TodoWrite fails", async () => {
+    const session = createSessionWithConfig({ provider: "cursor" });
+    const internals = asInternals<ACPSessionInternals>(session);
+    await internals.translateSessionUpdate({
+      sessionUpdate: "tool_call",
+      toolCallId: "todo-write-seed",
+      title: "TodoWrite",
+      kind: "other",
+      status: "completed",
+      rawInput: {
+        merge: false,
+        todos: [{ id: "keep", content: "Keep this", status: "pending" }],
+      },
+    });
+
+    const events = await internals.translateSessionUpdate({
+      sessionUpdate: "tool_call",
+      toolCallId: "todo-write-failed",
+      title: "TodoWrite",
+      kind: "other",
+      status: "failed",
+      rawInput: {
+        merge: false,
+        todos: [{ id: "replace", content: "Should not apply", status: "completed" }],
+      },
+    });
+
+    expect(events).not.toContainEqual(
+      expect.objectContaining({
+        type: "timeline",
+        item: expect.objectContaining({ type: "todo" }),
+      }),
+    );
+
+    const completed = await internals.translateSessionUpdate({
+      sessionUpdate: "tool_call",
+      toolCallId: "todo-write-still-kept",
+      title: "TodoWrite",
+      kind: "other",
+      status: "completed",
+      rawInput: {
+        merge: true,
+        todos: [{ id: "keep", content: "Keep this", status: "in_progress" }],
+      },
+    });
+    expect(completed).toContainEqual(
+      expect.objectContaining({
+        type: "timeline",
+        item: expect.objectContaining({
+          type: "todo",
+          items: [{ text: "Keep this", completed: false }],
         }),
       }),
     );
@@ -3285,6 +3341,93 @@ describe("ACPAgentSession", () => {
     });
   });
 
+  test("cursor/ask_question uses checked indexes when a multi-select label overlaps others", async () => {
+    const session = createSessionWithConfig({ provider: "cursor" });
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const ask = session.extMethod("cursor/ask_question", {
+      toolCallId: "ask-overlap",
+      questions: [
+        {
+          id: "q1",
+          prompt: "Which pieces?",
+          allowMultiple: true,
+          options: [
+            { id: "a", label: "A" },
+            { id: "b", label: "B" },
+            { id: "ab", label: "A, B" },
+          ],
+        },
+      ],
+    });
+    await Promise.resolve();
+
+    const requested = events.find((event) => event.type === "permission_requested");
+    if (requested?.type !== "permission_requested") {
+      throw new Error("Expected permission request");
+    }
+
+    // Checking "A" and "B" joins to the same text as checking the single "A, B" option.
+    await session.respondToPermission(requested.request.id, {
+      behavior: "allow",
+      updatedInput: {
+        answers: { q1: "A, B" },
+        selectedOptionIndexes: { q1: [0, 1] },
+      },
+    });
+
+    await expect(ask).resolves.toEqual({
+      outcome: {
+        outcome: "answered",
+        answers: [{ questionId: "q1", selectedOptionIds: ["a", "b"] }],
+      },
+    });
+  });
+
+  test("cursor/ask_question maps a checked overlapping label by its index", async () => {
+    const session = createSessionWithConfig({ provider: "cursor" });
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const ask = session.extMethod("cursor/ask_question", {
+      toolCallId: "ask-overlap-single",
+      questions: [
+        {
+          id: "q1",
+          prompt: "Which pieces?",
+          allowMultiple: true,
+          options: [
+            { id: "a", label: "A" },
+            { id: "b", label: "B" },
+            { id: "ab", label: "A, B" },
+          ],
+        },
+      ],
+    });
+    await Promise.resolve();
+
+    const requested = events.find((event) => event.type === "permission_requested");
+    if (requested?.type !== "permission_requested") {
+      throw new Error("Expected permission request");
+    }
+
+    await session.respondToPermission(requested.request.id, {
+      behavior: "allow",
+      updatedInput: {
+        answers: { q1: "A, B" },
+        selectedOptionIndexes: { q1: [2] },
+      },
+    });
+
+    await expect(ask).resolves.toEqual({
+      outcome: {
+        outcome: "answered",
+        answers: [{ questionId: "q1", selectedOptionIds: ["ab"] }],
+      },
+    });
+  });
+
   test("cursor/ask_question recovers multi-select labels that contain commas", async () => {
     const session = createSessionWithConfig({ provider: "cursor" });
     const events: AgentStreamEvent[] = [];
@@ -3341,9 +3484,9 @@ describe("ACPAgentSession", () => {
     });
   });
 
-  test("maps Create Plan tool_call fallback onto plan detail from rawInput", () => {
+  test("maps Create Plan tool_call fallback onto plan detail from rawInput", async () => {
     const session = createSessionWithConfig({ provider: "cursor" });
-    const events = asInternals<ACPSessionInternals>(session).translateSessionUpdate({
+    const events = await asInternals<ACPSessionInternals>(session).translateSessionUpdate({
       sessionUpdate: "tool_call",
       toolCallId: "fallback-plan-1",
       title: "Create Plan",
@@ -3381,7 +3524,7 @@ describe("ACPAgentSession", () => {
 
     try {
       const session = createSessionWithConfig({ provider: "cursor" });
-      const events = asInternals<ACPSessionInternals>(session).translateSessionUpdate({
+      const events = await asInternals<ACPSessionInternals>(session).translateSessionUpdate({
         sessionUpdate: "tool_call",
         toolCallId: "fallback-plan-2",
         title: "Other Create Plan",
@@ -3423,7 +3566,7 @@ describe("ACPAgentSession", () => {
 
     try {
       const session = createSessionWithConfig({ provider: "cursor" });
-      const events = asInternals<ACPSessionInternals>(session).translateSessionUpdate({
+      const events = await asInternals<ACPSessionInternals>(session).translateSessionUpdate({
         sessionUpdate: "tool_call",
         toolCallId: "search-plan-1",
         title: "Search files",
@@ -3452,9 +3595,9 @@ describe("ACPAgentSession", () => {
     }
   });
 
-  test("keeps a failed Create Plan tool call on the normal error display", () => {
+  test("keeps a failed Create Plan tool call on the normal error display", async () => {
     const session = createSessionWithConfig({ provider: "cursor" });
-    const events = asInternals<ACPSessionInternals>(session).translateSessionUpdate({
+    const events = await asInternals<ACPSessionInternals>(session).translateSessionUpdate({
       sessionUpdate: "tool_call",
       toolCallId: "failed-plan-1",
       title: "Create Plan",
@@ -3489,7 +3632,7 @@ describe("ACPAgentSession", () => {
 
     try {
       const session = createSessionWithConfig({ provider: "cursor" });
-      const events = asInternals<ACPSessionInternals>(session).translateSessionUpdate({
+      const events = await asInternals<ACPSessionInternals>(session).translateSessionUpdate({
         sessionUpdate: "tool_call",
         toolCallId: "fallback-plan-3",
         title: "Create Plan",

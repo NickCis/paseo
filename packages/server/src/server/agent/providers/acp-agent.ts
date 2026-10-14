@@ -1,7 +1,6 @@
 import { ACPProviderOptionsSchema } from "./acp-options.js";
 import { type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -1822,6 +1821,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private pendingUserMessage: PendingUserMessage | null = null;
   private submittedUserMessageTurnId: string | null = null;
   private readonly toolCalls = new Map<string, ACPToolSnapshot>();
+  private readonly planFileReads = new Map<string, PlanFileRead>();
   private readonly terminalEntries = new Map<string, TerminalEntry>();
   private readonly persistedHistory: AgentTimelineItem[] = [];
   private readonly initialHandle?: AgentPersistenceHandle;
@@ -2800,7 +2800,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       return;
     }
 
-    const events = this.translateSessionUpdate(params.update);
+    const events = await this.translateSessionUpdate(params.update);
     this.logger.trace(
       {
         agentId: this.agentId,
@@ -3233,7 +3233,32 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     return error instanceof Error && error.message === this.featureUnavailableMessage(featureId);
   }
 
-  private translateSessionUpdate(update: SessionUpdate): AgentStreamEvent[] {
+  private async ensurePlanFilesPrefetched(update: SessionUpdate): Promise<void> {
+    if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") {
+      return;
+    }
+
+    let snapshot = mergeToolSnapshot(
+      update.toolCallId,
+      update,
+      update.sessionUpdate === "tool_call_update"
+        ? this.toolCalls.get(update.toolCallId)
+        : undefined,
+    );
+    if (this.toolSnapshotTransformer) {
+      snapshot = this.toolSnapshotTransformer(snapshot);
+    }
+
+    for (const planPath of collectCreatePlanFilePaths(snapshot)) {
+      if (this.planFileReads.has(planPath)) {
+        continue;
+      }
+      this.planFileReads.set(planPath, await readPlanFileAsync(planPath));
+    }
+  }
+
+  private async translateSessionUpdate(update: SessionUpdate): Promise<AgentStreamEvent[]> {
+    await this.ensurePlanFilesPrefetched(update);
     if (update.sessionUpdate === "user_message_chunk") {
       return this.handleUserMessageChunk(update);
     }
@@ -3359,7 +3384,9 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     }
     this.toolCalls.set(toolCallId, snapshot);
     const events: AgentStreamEvent[] = [
-      this.wrapTimeline(mapToolSnapshotToTimeline(snapshot, this.terminalEntries)),
+      this.wrapTimeline(
+        mapToolSnapshotToTimeline(snapshot, this.terminalEntries, this.planFileReads),
+      ),
     ];
     const todoEvent = this.timelineEventFromCursorTodoWrite(snapshot);
     if (todoEvent) {
@@ -3370,7 +3397,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
 
   /** Cursor agent-mode TodoWrite updates the same checklist create_plan seeded. */
   private timelineEventFromCursorTodoWrite(snapshot: ACPToolSnapshot): AgentStreamEvent | null {
-    if (!isCursorTodoWriteTool(snapshot)) {
+    if (!isCursorTodoWriteTool(snapshot) || snapshot.status !== "completed") {
       return null;
     }
     const rawInput = readRecord(snapshot.rawInput);
@@ -3841,10 +3868,12 @@ export class ACPAgentSession implements AgentSession, ACPClient {
           return {
             outcome: {
               outcome: "answered",
-              answers: mapCursorAskQuestionAnswers(
-                questions,
-                readStringRecord(response.updatedInput?.answers),
-              ),
+              answers: mapCursorAskQuestionAnswers(questions, {
+                answers: readStringRecord(response.updatedInput?.answers),
+                selectedOptionIndexes: readSelectedOptionIndexes(
+                  response.updatedInput?.selectedOptionIndexes,
+                ),
+              }),
             },
           };
         },
@@ -3873,7 +3902,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
 
   private synthesizeCanceledToolCalls(): void {
     for (const snapshot of this.toolCalls.values()) {
-      const mapped = mapToolSnapshotToTimeline(snapshot, this.terminalEntries);
+      const mapped = mapToolSnapshotToTimeline(snapshot, this.terminalEntries, this.planFileReads);
       if (mapped.status === "running") {
         this.pushEvent(
           this.wrapTimeline({
@@ -4291,26 +4320,52 @@ function isCursorTodoWriteTool(snapshot: ACPToolSnapshot): boolean {
   return /^todo\s*write$/i.test(title) || /^update\s*todos$/i.test(title);
 }
 
+interface CursorAskQuestionAnswerInput {
+  answers: Record<string, string> | undefined;
+  /** Checked option indexes per question header. Absent from clients that only send labels. */
+  selectedOptionIndexes: Record<string, number[]> | undefined;
+}
+
 function mapCursorAskQuestionAnswers(
   questions: CursorAskQuestion[],
-  answers: Record<string, string> | undefined,
+  input: CursorAskQuestionAnswerInput,
 ): Array<{ questionId: string; selectedOptionIds: string[] }> {
-  if (!answers) {
+  if (!input.answers) {
     return questions.map((question) => ({ questionId: question.id, selectedOptionIds: [] }));
   }
 
   return questions.map((question) => {
-    const answerText = (answers[question.id] ?? answers[question.prompt] ?? "").trim();
+    const answerText = (
+      input.answers?.[question.id] ??
+      input.answers?.[question.prompt] ??
+      ""
+    ).trim();
     return {
       questionId: question.id,
-      selectedOptionIds: selectedCursorOptionIds(question, answerText),
+      selectedOptionIds: selectedCursorOptionIds(
+        question,
+        answerText,
+        input.selectedOptionIndexes?.[question.id],
+      ),
     };
   });
 }
 
-function selectedCursorOptionIds(question: CursorAskQuestion, answerText: string): string[] {
+function selectedCursorOptionIds(
+  question: CursorAskQuestion,
+  answerText: string,
+  selectedOptionIndexes: number[] | undefined,
+): string[] {
   if (!answerText) {
     return [];
+  }
+  // Checked indexes are unambiguous; labels joined with ", " can be split more than one way
+  // when a label itself contains ", " (e.g. "A", "B", and "A, B"). Take them before labels.
+  if (question.allowMultiple && selectedOptionIndexes) {
+    const byIndex = selectedOptionIdsFromIndexes(question, selectedOptionIndexes);
+    if (byIndex) {
+      return byIndex;
+    }
   }
   // The app sends the chosen label verbatim, and labels may contain commas.
   const exact = question.options.find((option) => option.label === answerText);
@@ -4320,9 +4375,46 @@ function selectedCursorOptionIds(question: CursorAskQuestion, answerText: string
   if (!question.allowMultiple) {
     return [];
   }
-  // Multi-select joins labels with ", ". Recover by longest-prefix match against known labels
-  // so a label like "Deploy, then test" is not split apart.
+  // COMPAT(cursor-question-indexes): added in v0.11.2, remove after 2026-11-14.
+  // Clients that predate selectedOptionIndexes send only the joined labels. Recover by
+  // longest-prefix match, which is ambiguous when one label is a prefix-split of another.
   return parseJoinedCursorOptionLabels(answerText, question.options);
+}
+
+function selectedOptionIdsFromIndexes(
+  question: CursorAskQuestion,
+  indexes: number[],
+): string[] | null {
+  if (indexes.length === 0) {
+    return null;
+  }
+  const ids: string[] = [];
+  for (const index of indexes) {
+    const option = question.options[index];
+    if (!option) {
+      return null;
+    }
+    if (!ids.includes(option.id)) {
+      ids.push(option.id);
+    }
+  }
+  return ids;
+}
+
+function readSelectedOptionIndexes(value: unknown): Record<string, number[]> | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const result: Record<string, number[]> = {};
+  for (const [header, entry] of Object.entries(value)) {
+    if (
+      Array.isArray(entry) &&
+      entry.every((index) => typeof index === "number" && Number.isInteger(index) && index >= 0)
+    ) {
+      result[header] = entry;
+    }
+  }
+  return result;
 }
 
 function parseJoinedCursorOptionLabels(
@@ -4357,7 +4449,10 @@ function parseJoinedCursorOptionLabels(
   return selectedOptionIds;
 }
 
-function tryMapCreatePlanToolDetail(context: MapToolDetailContext): ToolCallDetail | null {
+function tryMapCreatePlanToolDetail(
+  context: MapToolDetailContext,
+  planFileReads: Map<string, PlanFileRead>,
+): ToolCallDetail | null {
   const { snapshot, textContent, rawInput, rawOutput } = context;
   // Only Cursor's own "Create Plan" tool calls. Failed calls keep the normal error display.
   if (!/create\s*plan/i.test(snapshot.title ?? "") || snapshot.status === "failed") {
@@ -4378,7 +4473,7 @@ function tryMapCreatePlanToolDetail(context: MapToolDetailContext): ToolCallDeta
     return null;
   }
 
-  const planFile = readPlanFile(planPath);
+  const planFile = readPlanFileFromCache(planPath, planFileReads);
   switch (planFile.status) {
     case "text":
       return { type: "plan", text: planFile.text };
@@ -4414,9 +4509,16 @@ type PlanFileRead =
   | { status: "absent" }
   | { status: "error"; message: string };
 
-function readPlanFile(filePath: string): PlanFileRead {
+function readPlanFileFromCache(
+  filePath: string,
+  planFileReads: Map<string, PlanFileRead>,
+): PlanFileRead {
+  return planFileReads.get(filePath) ?? { status: "absent" };
+}
+
+async function readPlanFileAsync(filePath: string): Promise<PlanFileRead> {
   try {
-    const content = readFileSync(filePath, "utf8");
+    const content = await fs.readFile(filePath, "utf8");
     return content.trim().length > 0 ? { status: "text", text: content } : { status: "absent" };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
@@ -4426,12 +4528,35 @@ function readPlanFile(filePath: string): PlanFileRead {
   }
 }
 
+function collectCreatePlanFilePaths(snapshot: ACPToolSnapshot): string[] {
+  if (!/create\s*plan/i.test(snapshot.title ?? "") || snapshot.status === "failed") {
+    return [];
+  }
+
+  const rawInput = readRecord(snapshot.rawInput);
+  if (readString(rawInput, ["plan"])) {
+    return [];
+  }
+
+  const textContent = extractToolText(snapshot.content);
+  const outputText = stringifyUnknown(snapshot.rawOutput) ?? "";
+  const rawOutput = readRecord(snapshot.rawOutput);
+  const planPaths = [
+    extractPlanFilePath(textContent ?? ""),
+    extractPlanFilePath(outputText),
+    extractPlanFilePath(readString(rawOutput, ["text", "content", "message"]) ?? ""),
+  ].filter((planPath): planPath is string => Boolean(planPath));
+
+  return [...new Set(planPaths)];
+}
+
 function mapToolSnapshotToTimeline(
   snapshot: ACPToolSnapshot,
   terminals: Map<string, TerminalEntry>,
+  planFileReads: Map<string, PlanFileRead>,
 ): ToolCallTimelineItem {
   const status = mapToolStatus(snapshot.status);
-  const detail = mapToolDetail(snapshot, terminals);
+  const detail = mapToolDetail(snapshot, terminals, planFileReads);
   const base = {
     type: "tool_call" as const,
     callId: snapshot.toolCallId,
@@ -4489,6 +4614,7 @@ interface MapToolDetailContext {
 function mapToolDetail(
   snapshot: ACPToolSnapshot,
   terminals: Map<string, TerminalEntry>,
+  planFileReads: Map<string, PlanFileRead>,
 ): ToolCallDetail {
   const context: MapToolDetailContext = {
     snapshot,
@@ -4500,7 +4626,7 @@ function mapToolDetail(
     rawOutput: readRecord(snapshot.rawOutput),
   };
 
-  const createPlanDetail = tryMapCreatePlanToolDetail(context);
+  const createPlanDetail = tryMapCreatePlanToolDetail(context, planFileReads);
   if (createPlanDetail) {
     return createPlanDetail;
   }
@@ -4699,7 +4825,7 @@ function mapPermissionRequest(
           text: chooserText,
           icon: "wrench",
         }
-      : mapToolDetail(snapshot, new Map()),
+      : mapToolDetail(snapshot, new Map(), new Map()),
     actions: params.options.map((option) => ({
       id: option.optionId,
       label: option.name,
