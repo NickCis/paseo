@@ -9,7 +9,10 @@ import type {
   AgentStreamEvent,
 } from "./agent-sdk-types.js";
 import type { AgentManagerEvent } from "./agent-manager.js";
-import { respondToAgentPermission } from "./permission-response.js";
+import {
+  PlanningTurnFollowUpTimeoutError,
+  respondToAgentPermission,
+} from "./permission-response.js";
 
 class FakePermissionAgentManager {
   permissionResult: AgentPermissionResult | void;
@@ -260,12 +263,22 @@ describe("respondToAgentPermission", () => {
       response: { behavior: "allow" },
       logger,
     });
-    const expectation = expect(pending).rejects.toThrow(
-      /Timed out waiting for agent agent-1 planning turn plan-turn to complete/,
+    let caught: unknown;
+    const pendingSettled = pending.catch((error: unknown) => {
+      caught = error;
+      throw error;
+    });
+    const expectation = expect(pendingSettled).rejects.toBeInstanceOf(
+      PlanningTurnFollowUpTimeoutError,
     );
     await vi.advanceTimersByTimeAsync(30_000);
     await expectation;
 
+    expect(caught).toMatchObject({
+      agentId: "agent-1",
+      turnId: "plan-turn",
+      timeoutMs: 30_000,
+    });
     expect(agentManager.streamRuns).toEqual([]);
     expect(agentManager.replacementRuns).toEqual([]);
     vi.useRealTimers();
