@@ -3327,7 +3327,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
 
   /** Cursor agent-mode TodoWrite updates the same checklist create_plan seeded. */
   private timelineEventFromCursorTodoWrite(snapshot: ACPToolSnapshot): AgentStreamEvent | null {
-    if (!isCursorTodoWriteTool(snapshot)) {
+    if (!isCursorTodoWriteTool(snapshot) || snapshot.status !== "completed") {
       return null;
     }
     const rawInput = readRecord(snapshot.rawInput);
@@ -3798,10 +3798,12 @@ export class ACPAgentSession implements AgentSession, ACPClient {
           return {
             outcome: {
               outcome: "answered",
-              answers: mapCursorAskQuestionAnswers(
-                questions,
-                readStringRecord(response.updatedInput?.answers),
-              ),
+              answers: mapCursorAskQuestionAnswers(questions, {
+                answers: readStringRecord(response.updatedInput?.answers),
+                selectedOptionIndexes: readSelectedOptionIndexes(
+                  response.updatedInput?.selectedOptionIndexes,
+                ),
+              }),
             },
           };
         },
@@ -4248,26 +4250,52 @@ function isCursorTodoWriteTool(snapshot: ACPToolSnapshot): boolean {
   return /^todo\s*write$/i.test(title) || /^update\s*todos$/i.test(title);
 }
 
+interface CursorAskQuestionAnswerInput {
+  answers: Record<string, string> | undefined;
+  /** Checked option indexes per question header. Absent from clients that only send labels. */
+  selectedOptionIndexes: Record<string, number[]> | undefined;
+}
+
 function mapCursorAskQuestionAnswers(
   questions: CursorAskQuestion[],
-  answers: Record<string, string> | undefined,
+  input: CursorAskQuestionAnswerInput,
 ): Array<{ questionId: string; selectedOptionIds: string[] }> {
-  if (!answers) {
+  if (!input.answers) {
     return questions.map((question) => ({ questionId: question.id, selectedOptionIds: [] }));
   }
 
   return questions.map((question) => {
-    const answerText = (answers[question.id] ?? answers[question.prompt] ?? "").trim();
+    const answerText = (
+      input.answers?.[question.id] ??
+      input.answers?.[question.prompt] ??
+      ""
+    ).trim();
     return {
       questionId: question.id,
-      selectedOptionIds: selectedCursorOptionIds(question, answerText),
+      selectedOptionIds: selectedCursorOptionIds(
+        question,
+        answerText,
+        input.selectedOptionIndexes?.[question.id],
+      ),
     };
   });
 }
 
-function selectedCursorOptionIds(question: CursorAskQuestion, answerText: string): string[] {
+function selectedCursorOptionIds(
+  question: CursorAskQuestion,
+  answerText: string,
+  selectedOptionIndexes: number[] | undefined,
+): string[] {
   if (!answerText) {
     return [];
+  }
+  // Checked indexes are unambiguous; labels joined with ", " can be split more than one way
+  // when a label itself contains ", " (e.g. "A", "B", and "A, B"). Take them before labels.
+  if (question.allowMultiple && selectedOptionIndexes) {
+    const byIndex = selectedOptionIdsFromIndexes(question, selectedOptionIndexes);
+    if (byIndex) {
+      return byIndex;
+    }
   }
   // The app sends the chosen label verbatim, and labels may contain commas.
   const exact = question.options.find((option) => option.label === answerText);
@@ -4277,9 +4305,46 @@ function selectedCursorOptionIds(question: CursorAskQuestion, answerText: string
   if (!question.allowMultiple) {
     return [];
   }
-  // Multi-select joins labels with ", ". Recover by longest-prefix match against known labels
-  // so a label like "Deploy, then test" is not split apart.
+  // COMPAT(cursor-question-indexes): added in v0.11.2, remove after 2026-11-14.
+  // Clients that predate selectedOptionIndexes send only the joined labels. Recover by
+  // longest-prefix match, which is ambiguous when one label is a prefix-split of another.
   return parseJoinedCursorOptionLabels(answerText, question.options);
+}
+
+function selectedOptionIdsFromIndexes(
+  question: CursorAskQuestion,
+  indexes: number[],
+): string[] | null {
+  if (indexes.length === 0) {
+    return null;
+  }
+  const ids: string[] = [];
+  for (const index of indexes) {
+    const option = question.options[index];
+    if (!option) {
+      return null;
+    }
+    if (!ids.includes(option.id)) {
+      ids.push(option.id);
+    }
+  }
+  return ids;
+}
+
+function readSelectedOptionIndexes(value: unknown): Record<string, number[]> | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const result: Record<string, number[]> = {};
+  for (const [header, entry] of Object.entries(value)) {
+    if (
+      Array.isArray(entry) &&
+      entry.every((index) => typeof index === "number" && Number.isInteger(index) && index >= 0)
+    ) {
+      result[header] = entry;
+    }
+  }
+  return result;
 }
 
 function parseJoinedCursorOptionLabels(

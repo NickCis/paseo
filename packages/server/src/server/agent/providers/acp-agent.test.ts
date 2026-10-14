@@ -3139,6 +3139,62 @@ describe("ACPAgentSession", () => {
     );
   });
 
+  test("does not update the plan checklist when Cursor TodoWrite fails", () => {
+    const session = createSessionWithConfig({ provider: "cursor" });
+    const internals = asInternals<ACPSessionInternals>(session);
+    internals.translateSessionUpdate({
+      sessionUpdate: "tool_call",
+      toolCallId: "todo-write-seed",
+      title: "TodoWrite",
+      kind: "other",
+      status: "completed",
+      rawInput: {
+        merge: false,
+        todos: [{ id: "keep", content: "Keep this", status: "pending" }],
+      },
+    });
+
+    const events = internals.translateSessionUpdate({
+      sessionUpdate: "tool_call",
+      toolCallId: "todo-write-failed",
+      title: "TodoWrite",
+      kind: "other",
+      status: "failed",
+      rawInput: {
+        merge: false,
+        todos: [{ id: "replace", content: "Should not apply", status: "completed" }],
+      },
+    });
+
+    expect(events).not.toContainEqual(
+      expect.objectContaining({
+        type: "timeline",
+        item: expect.objectContaining({ type: "todo" }),
+      }),
+    );
+
+    const completed = internals.translateSessionUpdate({
+      sessionUpdate: "tool_call",
+      toolCallId: "todo-write-still-kept",
+      title: "TodoWrite",
+      kind: "other",
+      status: "completed",
+      rawInput: {
+        merge: true,
+        todos: [{ id: "keep", content: "Keep this", status: "in_progress" }],
+      },
+    });
+    expect(completed).toContainEqual(
+      expect.objectContaining({
+        type: "timeline",
+        item: expect.objectContaining({
+          type: "todo",
+          items: [{ text: "Keep this", completed: false }],
+        }),
+      }),
+    );
+  });
+
   test("cursor/ask_question maps answers back to Cursor option ids", async () => {
     const session = createSessionWithConfig({ provider: "cursor" });
     const events: AgentStreamEvent[] = [];
@@ -3230,6 +3286,93 @@ describe("ACPAgentSession", () => {
       outcome: {
         outcome: "answered",
         answers: [{ questionId: "q1", selectedOptionIds: ["deploy-test"] }],
+      },
+    });
+  });
+
+  test("cursor/ask_question uses checked indexes when a multi-select label overlaps others", async () => {
+    const session = createSessionWithConfig({ provider: "cursor" });
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const ask = session.extMethod("cursor/ask_question", {
+      toolCallId: "ask-overlap",
+      questions: [
+        {
+          id: "q1",
+          prompt: "Which pieces?",
+          allowMultiple: true,
+          options: [
+            { id: "a", label: "A" },
+            { id: "b", label: "B" },
+            { id: "ab", label: "A, B" },
+          ],
+        },
+      ],
+    });
+    await Promise.resolve();
+
+    const requested = events.find((event) => event.type === "permission_requested");
+    if (requested?.type !== "permission_requested") {
+      throw new Error("Expected permission request");
+    }
+
+    // Checking "A" and "B" joins to the same text as checking the single "A, B" option.
+    await session.respondToPermission(requested.request.id, {
+      behavior: "allow",
+      updatedInput: {
+        answers: { q1: "A, B" },
+        selectedOptionIndexes: { q1: [0, 1] },
+      },
+    });
+
+    await expect(ask).resolves.toEqual({
+      outcome: {
+        outcome: "answered",
+        answers: [{ questionId: "q1", selectedOptionIds: ["a", "b"] }],
+      },
+    });
+  });
+
+  test("cursor/ask_question maps a checked overlapping label by its index", async () => {
+    const session = createSessionWithConfig({ provider: "cursor" });
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const ask = session.extMethod("cursor/ask_question", {
+      toolCallId: "ask-overlap-single",
+      questions: [
+        {
+          id: "q1",
+          prompt: "Which pieces?",
+          allowMultiple: true,
+          options: [
+            { id: "a", label: "A" },
+            { id: "b", label: "B" },
+            { id: "ab", label: "A, B" },
+          ],
+        },
+      ],
+    });
+    await Promise.resolve();
+
+    const requested = events.find((event) => event.type === "permission_requested");
+    if (requested?.type !== "permission_requested") {
+      throw new Error("Expected permission request");
+    }
+
+    await session.respondToPermission(requested.request.id, {
+      behavior: "allow",
+      updatedInput: {
+        answers: { q1: "A, B" },
+        selectedOptionIndexes: { q1: [2] },
+      },
+    });
+
+    await expect(ask).resolves.toEqual({
+      outcome: {
+        outcome: "answered",
+        answers: [{ questionId: "q1", selectedOptionIds: ["ab"] }],
       },
     });
   });
