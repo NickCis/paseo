@@ -2606,7 +2606,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     }
 
     // Cursor CreatePlan must settle as accepted before the implement turn starts.
-    // replaceRunning: false waits for that planning turn to end instead of canceling it.
+    // replaceRunning: false waits for turn_completed (not mere idle) so Stop drops Implement.
     if (isCursorPlanApproval) {
       return {
         followUpPrompt: CURSOR_PLAN_IMPLEMENTATION_PROMPT,

@@ -655,8 +655,9 @@ export interface AgentPermissionResult {
   /**
    * How to start `followUpPrompt` when a turn is already in flight.
    * Defaults to true (Codex): cancel the current turn and replace it.
-   * False (Cursor create_plan): wait for the current turn to finish, then
-   * start the follow-up without canceling — CreatePlan must settle as accepted.
+   * False (Cursor create_plan): wait for that planning turn to `turn_completed`,
+   * then start the follow-up without canceling. Stop/`turn_canceled` drops the
+   * follow-up — idle alone is not enough (CreatePlan must settle as accepted).
    */
   replaceRunning?: boolean;
 }

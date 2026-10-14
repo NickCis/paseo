@@ -54,12 +54,12 @@ still probes model selections in its own shim. The initial session supplies mode
 model; it does not override the model list returned by a resolver.
 
 Accepting a Cursor plan ends Cursor's planning turn. Paseo switches out of `plan`/`ask` before the
-approval resolves, then waits for CreatePlan to settle as accepted before starting the
-implementation follow-up — canceling that turn marks CreatePlan interrupted and leaves plan todos
-stuck. The follow-up also tells Cursor to drive those todos with `TodoWrite`; without that nudge
-Cursor often finishes the work and never marks steps completed. If the mode switch fails, the
-approval stays pending so it can be retried. See the `cursor/*` handling in `ACPAgentSession`
-(`packages/server/src/server/agent/providers/acp-agent.ts`).
+approval resolves, then waits for that planning turn's `turn_completed` before starting the
+implementation follow-up — canceling the turn (Stop) drops the follow-up; interrupting CreatePlan
+also leaves plan todos stuck. The follow-up also tells Cursor to drive those todos with `TodoWrite`;
+without that nudge Cursor often finishes the work and never marks steps completed. If the mode
+switch fails, the approval stays pending so it can be retried. See the `cursor/*` handling in
+`ACPAgentSession` (`packages/server/src/server/agent/providers/acp-agent.ts`).
 
 ### Direct
 
