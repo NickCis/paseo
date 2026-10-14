@@ -4342,27 +4342,28 @@ function mapCursorAskQuestionAnswers(
     ).trim();
     return {
       questionId: question.id,
-      selectedOptionIds: selectedCursorOptionIds(
+      selectedOptionIds: selectedCursorOptionIds({
         question,
         answerText,
-        input.selectedOptionIndexes?.[question.id],
-      ),
+        selectedOptionIndexes: input.selectedOptionIndexes?.[question.id],
+      }),
     };
   });
 }
 
-function selectedCursorOptionIds(
-  question: CursorAskQuestion,
-  answerText: string,
-  selectedOptionIndexes: number[] | undefined,
-): string[] {
+function selectedCursorOptionIds(params: {
+  question: CursorAskQuestion;
+  answerText: string;
+  selectedOptionIndexes: number[] | undefined;
+}): string[] {
+  const { question, answerText, selectedOptionIndexes } = params;
   if (!answerText) {
     return [];
   }
   // Checked indexes are unambiguous; labels joined with ", " can be split more than one way
   // when a label itself contains ", " (e.g. "A", "B", and "A, B"). Take them before labels.
   if (question.allowMultiple && selectedOptionIndexes) {
-    const byIndex = selectedOptionIdsFromIndexes(question, selectedOptionIndexes);
+    const byIndex = selectedOptionIdsFromIndexes({ question, indexes: selectedOptionIndexes });
     if (byIndex) {
       return byIndex;
     }
@@ -4381,10 +4382,11 @@ function selectedCursorOptionIds(
   return parseJoinedCursorOptionLabels(answerText, question.options);
 }
 
-function selectedOptionIdsFromIndexes(
-  question: CursorAskQuestion,
-  indexes: number[],
-): string[] | null {
+function selectedOptionIdsFromIndexes(params: {
+  question: CursorAskQuestion;
+  indexes: number[];
+}): string[] | null {
+  const { question, indexes } = params;
   if (indexes.length === 0) {
     return null;
   }

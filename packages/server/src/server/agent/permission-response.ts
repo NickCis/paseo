@@ -26,6 +26,22 @@ const FOLLOW_UP_TURN_TIMEOUT_MS = 30_000;
 
 type PlanningTurnSettlement = "completed" | "canceled" | "failed";
 
+export class PlanningTurnFollowUpTimeoutError extends Error {
+  readonly agentId: string;
+  readonly turnId: string;
+  readonly timeoutMs: number;
+
+  constructor(params: { agentId: string; turnId: string; timeoutMs: number }) {
+    super(
+      `Timed out waiting for agent ${params.agentId} planning turn ${params.turnId} to complete before starting the follow-up prompt`,
+    );
+    this.name = "PlanningTurnFollowUpTimeoutError";
+    this.agentId = params.agentId;
+    this.turnId = params.turnId;
+    this.timeoutMs = params.timeoutMs;
+  }
+}
+
 export async function respondToAgentPermission(
   params: RespondToAgentPermissionParams,
 ): Promise<void> {
@@ -40,7 +56,7 @@ export async function respondToAgentPermission(
   const planningTurnId = agentManager.getAgent(agentId)?.activeForegroundTurnId ?? null;
   const settlementWatcher =
     planningTurnId !== null
-      ? watchPlanningTurnSettlement(agentManager, agentId, planningTurnId)
+      ? watchPlanningTurnSettlement({ agentManager, agentId, turnId: planningTurnId })
       : null;
 
   try {
@@ -83,14 +99,15 @@ export async function respondToAgentPermission(
   }
 }
 
-function watchPlanningTurnSettlement(
-  agentManager: PermissionResponseAgentManager,
-  agentId: string,
-  turnId: string,
-): {
+function watchPlanningTurnSettlement(params: {
+  agentManager: PermissionResponseAgentManager;
+  agentId: string;
+  turnId: string;
+}): {
   wait: (timeoutMs: number) => Promise<PlanningTurnSettlement>;
   dispose: () => void;
 } {
+  const { agentManager, agentId, turnId } = params;
   let settled: PlanningTurnSettlement | null = null;
   let resolveWait: ((outcome: PlanningTurnSettlement) => void) | null = null;
   let rejectWait: ((error: Error) => void) | null = null;
@@ -157,9 +174,11 @@ function watchPlanningTurnSettlement(
         timeoutId = setTimeout(() => {
           unsubscribe();
           rejectWait?.(
-            new Error(
-              `Timed out waiting for agent ${agentId} planning turn ${turnId} to complete before starting the follow-up prompt`,
-            ),
+            new PlanningTurnFollowUpTimeoutError({
+              agentId,
+              turnId,
+              timeoutMs,
+            }),
           );
         }, timeoutMs);
       }),
