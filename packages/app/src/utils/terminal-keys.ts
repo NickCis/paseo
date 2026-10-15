@@ -135,6 +135,35 @@ export function shouldInterceptDomTerminalKey(args: {
   return false;
 }
 
+export type TerminalClipboardAction = "copy" | "paste";
+
+// Non-macOS clipboard chords the terminal claims before xterm sends them to the PTY.
+// Copy only applies when text is selected; otherwise the chord falls through (caller decides).
+// Ctrl+Shift+V pastes through the browser natively, so it is never listed here.
+export function resolveTerminalClipboardShortcut(args: {
+  key: string;
+  ctrlKey: boolean;
+  shiftKey: boolean;
+  altKey: boolean;
+  metaKey: boolean;
+  overrideControlSequences: boolean;
+}): TerminalClipboardAction | null {
+  if (args.altKey || args.metaKey || typeof args.key !== "string") {
+    return null;
+  }
+  const key = args.key.toLowerCase();
+  if (args.overrideControlSequences) {
+    // Historical: claim Ctrl+C / Ctrl+V so the shell never sees those sequences.
+    if (args.ctrlKey && !args.shiftKey && key === "c") return "copy";
+    if (args.ctrlKey && !args.shiftKey && key === "v") return "paste";
+    return null;
+  }
+  // Shell keeps Ctrl+C / Ctrl+V. Emulator clipboard uses Ctrl+Shift+C and Shift+Insert.
+  if (args.ctrlKey && args.shiftKey && key === "c") return "copy";
+  if (!args.ctrlKey && args.shiftKey && key === "insert") return "paste";
+  return null;
+}
+
 interface MacTerminalEditingShortcutInput {
   key: string;
   ctrlKey: boolean;

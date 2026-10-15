@@ -2206,6 +2206,11 @@ export const fr: TranslationResources = {
         description: "Lignes conservées dans le tampon du terminal intégré",
         accessibilityLabel: "Lignes d’historique du terminal",
       },
+      terminalOverrideControlSequences: {
+        label: "Remplacer les séquences de contrôle",
+        description:
+          "Utilise Ctrl+C, Ctrl+V et Ctrl+F pour copier, coller et rechercher au lieu de les envoyer au shell. Désactivez pour le comportement readline de Ctrl+F et Ctrl+V ; copier et coller utilisent Ctrl+Shift+C et Shift+Insert.",
+      },
       autoExpandReasoning: {
         label: "Toujours afficher le raisonnement",
         description: "Afficher par défaut le raisonnement de l’agent entièrement déplié",

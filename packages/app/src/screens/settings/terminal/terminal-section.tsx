@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Text, View } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
 import { useTranslation } from "react-i18next";
-import { SettingsSection } from "@/components/settings";
+import { SettingsCard, SettingsSection, SettingsSwitch } from "@/components/settings";
 import { FormTextInput } from "@/components/ui/form-field";
 import { parseTerminalScrollbackLines, useAppSettings } from "@/hooks/use-settings";
 import { settingsStyles } from "@/styles/settings";
@@ -25,13 +25,19 @@ export function TerminalSection() {
     }
   }, [scrollbackValue, settings.terminalScrollbackLines, updateSettings]);
 
+  const changeOverrideControlSequences = useCallback(
+    (terminalOverrideControlSequences: boolean) =>
+      void updateSettings({ terminalOverrideControlSequences }),
+    [updateSettings],
+  );
+
   useEffect(() => {
     setScrollbackValue(String(settings.terminalScrollbackLines));
   }, [settings.terminalScrollbackLines]);
 
   return (
     <SettingsSection title={t("settings.sections.terminal")}>
-      <View style={settingsStyles.card}>
+      <SettingsCard>
         <View style={settingsStyles.row}>
           <View style={settingsStyles.rowContent}>
             <Text style={settingsStyles.rowTitle}>
@@ -54,7 +60,13 @@ export function TerminalSection() {
             accessibilityLabel={t("settings.general.terminalScrollback.accessibilityLabel")}
           />
         </View>
-      </View>
+        <SettingsSwitch
+          label={t("settings.general.terminalOverrideControlSequences.label")}
+          hint={t("settings.general.terminalOverrideControlSequences.description")}
+          value={settings.terminalOverrideControlSequences}
+          onValueChange={changeOverrideControlSequences}
+        />
+      </SettingsCard>
     </SettingsSection>
   );
 }

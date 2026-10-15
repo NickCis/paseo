@@ -109,6 +109,7 @@ interface TerminalEmulatorProps {
   testId?: string;
   xtermTheme?: ITheme;
   scrollbackLines: number;
+  overrideControlSequences?: boolean;
   fontFamily?: string;
   fontSize?: number;
   keyboardInset?: number;
@@ -174,6 +175,7 @@ export default function TerminalEmulator({
     cursor: "#e6e6e6",
   },
   scrollbackLines,
+  overrideControlSequences = true,
   fontFamily,
   fontSize,
   swipeGesturesEnabled = false,
@@ -203,6 +205,8 @@ export default function TerminalEmulator({
   const fontSizeRef = useRef(fontSize);
   const scrollbackLinesRef = useRef(scrollbackLines);
   scrollbackLinesRef.current = scrollbackLines;
+  const overrideControlSequencesRef = useRef(overrideControlSequences);
+  overrideControlSequencesRef.current = overrideControlSequences;
   fontFamilyRef.current = fontFamily;
   fontSizeRef.current = fontSize;
   const themeKey = useMemo(() => buildXtermThemeKey(xtermTheme), [xtermTheme]);
@@ -343,6 +347,10 @@ export default function TerminalEmulator({
   }, [scrollbackLines]);
 
   useEffect(() => {
+    runtimeRef.current?.setOverrideControlSequences({ overrideControlSequences });
+  }, [overrideControlSequences]);
+
+  useEffect(() => {
     const root = rootRef.current;
     if (!root || !swipeGesturesEnabled) {
       return () => {};
@@ -465,7 +473,9 @@ export default function TerminalEmulator({
       return () => {};
     }
 
-    const runtime = new TerminalEmulatorRuntime();
+    const runtime = new TerminalEmulatorRuntime({
+      overrideControlSequences: overrideControlSequencesRef.current,
+    });
     runtimeRef.current = runtime;
     runtime.setCallbacks({
       callbacks: {

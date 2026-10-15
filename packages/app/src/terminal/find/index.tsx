@@ -10,8 +10,14 @@ import {
 import { View, type LayoutChangeEvent } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
 import { useTranslation } from "react-i18next";
-import { PaneFind, findShortcutPlatform, isFindShortcut, type PaneFindHandle } from "@/pane-find";
+import {
+  PaneFind,
+  findShortcutPlatform,
+  resolveTerminalFindShortcut,
+  type PaneFindHandle,
+} from "@/pane-find";
 import { isWeb } from "@/constants/platform";
+import { useAppSettings } from "@/hooks/use-settings";
 import { hasActiveWebOverlay } from "@/lib/overlay-root";
 import { isImeComposingKeyboardEvent } from "@/utils/keyboard-ime";
 import type { TerminalEmulatorHandle } from "@/components/terminal-emulator-contract";
@@ -31,6 +37,8 @@ export const TerminalFind = forwardRef<
     focusTerminal(): void;
   }
 >(function TerminalFind({ terminal, active, focusTerminal }, ref) {
+  const { settings } = useAppSettings();
+  const overrideControlSequences = settings.terminalOverrideControlSequences;
   const { t } = useTranslation();
   const widget = useRef<PaneFindHandle>(null);
   const [open, setOpen] = useState(false);
@@ -64,14 +72,17 @@ export const TerminalFind = forwardRef<
     function onKeyDown(event: KeyboardEvent) {
       if (event.defaultPrevented || hasActiveWebOverlay() || isImeComposingKeyboardEvent(event))
         return;
-      if (isFindShortcut(event, findShortcutPlatform()) && terminal.current?.find) {
+      if (
+        resolveTerminalFindShortcut(event, findShortcutPlatform(), overrideControlSequences) &&
+        terminal.current?.find
+      ) {
         event.preventDefault();
         show();
       }
     }
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [active, show, terminal]);
+  }, [active, overrideControlSequences, show, terminal]);
   const search = useCallback(
     (text: string) => {
       setQuery(text);

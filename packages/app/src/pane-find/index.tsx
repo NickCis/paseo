@@ -36,7 +36,12 @@ import { isImeComposingKeyboardEvent } from "@/utils/keyboard-ime";
 import { getShortcutOs } from "@/utils/shortcut-platform";
 import { isFindShortcut, type FindShortcutPlatform } from "./find-shortcut";
 
-export { isFindShortcut, type FindShortcutPlatform } from "./find-shortcut";
+export {
+  isFindShortcut,
+  isTerminalFindShortcut,
+  resolveTerminalFindShortcut,
+  type FindShortcutPlatform,
+} from "./find-shortcut";
 
 /** The platform every Find surface judges the shortcut against. */
 export function findShortcutPlatform(): FindShortcutPlatform {
