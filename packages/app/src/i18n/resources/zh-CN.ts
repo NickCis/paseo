@@ -2133,6 +2133,11 @@ export const zhCN: TranslationResources = {
         description: "内置终端缓冲区保留的行数",
         accessibilityLabel: "终端回滚行数",
       },
+      terminalOverrideControlSequences: {
+        label: "覆盖控制序列",
+        description:
+          "将 Ctrl+C、Ctrl+V 和 Ctrl+F 用于复制、粘贴和查找，而不是发送给 shell。关闭后可使用 readline 风格的 Ctrl+F/V；复制和粘贴改为 Ctrl+Shift+C 与 Shift+Insert。",
+      },
       autoExpandReasoning: {
         label: "始终展开推理过程",
         description: "默认情况下完全展开 AI 的思考和推理过程",

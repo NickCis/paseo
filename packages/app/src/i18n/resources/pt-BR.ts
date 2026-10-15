@@ -2192,6 +2192,11 @@ export const ptBR: TranslationResources = {
         description: "Linhas mantidas no buffer do terminal integrado",
         accessibilityLabel: "Linhas do scrollback do terminal",
       },
+      terminalOverrideControlSequences: {
+        label: "Substituir sequências de controle",
+        description:
+          "Usa Ctrl+C, Ctrl+V e Ctrl+F para copiar, colar e buscar em vez de enviá-las ao shell. Desative para o comportamento estilo readline de Ctrl+F e Ctrl+V; copiar e colar usam Ctrl+Shift+C e Shift+Insert.",
+      },
       autoExpandReasoning: {
         label: "Sempre expandir raciocínio",
         description:

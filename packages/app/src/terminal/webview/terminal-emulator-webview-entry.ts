@@ -18,6 +18,7 @@ interface MountMessage {
   streamKey: string;
   initialSnapshot: TerminalState | null;
   scrollbackLines: number;
+  overrideControlSequences: boolean;
   theme: ITheme;
   fontFamily?: string;
   fontSize?: number;
@@ -40,6 +41,11 @@ type InboundMessage =
   | { type: "resize"; streamKey: string; forceClaim: boolean; shouldClaim?: boolean }
   | { type: "setTheme"; streamKey: string; theme: ITheme }
   | { type: "setScrollback"; streamKey: string; lines: number }
+  | {
+      type: "setOverrideControlSequences";
+      streamKey: string;
+      overrideControlSequences: boolean;
+    }
   | { type: "setFont"; streamKey: string; fontFamily?: string; fontSize?: number }
   | { type: "setPendingModifiers"; streamKey: string; pendingModifiers: PendingTerminalModifiers }
   | { type: "setSwipeGesturesEnabled"; streamKey: string; enabled: boolean }
@@ -300,6 +306,11 @@ class TerminalWebViewBridge {
       case "setScrollback":
         this.runtime?.setScrollback({ lines: message.lines });
         return true;
+      case "setOverrideControlSequences":
+        this.runtime?.setOverrideControlSequences({
+          overrideControlSequences: message.overrideControlSequences,
+        });
+        return true;
       case "setFont":
         this.runtime?.setFont({ fontFamily: message.fontFamily, fontSize: message.fontSize });
         return true;
@@ -320,7 +331,9 @@ class TerminalWebViewBridge {
     this.swipeGesturesEnabled = message.swipeGesturesEnabled;
     this.applyThemeBackground(message.theme);
 
-    const runtime = new TerminalEmulatorRuntime();
+    const runtime = new TerminalEmulatorRuntime({
+      overrideControlSequences: message.overrideControlSequences,
+    });
     this.runtime = runtime;
     runtime.setCallbacks({
       callbacks: {

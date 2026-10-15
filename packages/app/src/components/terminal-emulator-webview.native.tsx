@@ -40,6 +40,7 @@ type BridgeInboundMessage =
       streamKey: string;
       initialSnapshot: TerminalState | null;
       scrollbackLines: number;
+      overrideControlSequences: boolean;
       theme: ITheme;
       fontFamily?: string;
       fontSize?: number;
@@ -59,6 +60,11 @@ type BridgeInboundMessage =
   | { type: "resize"; streamKey: string; forceClaim: boolean; shouldClaim?: boolean }
   | { type: "setTheme"; streamKey: string; theme: ITheme }
   | { type: "setScrollback"; streamKey: string; lines: number }
+  | {
+      type: "setOverrideControlSequences";
+      streamKey: string;
+      overrideControlSequences: boolean;
+    }
   | { type: "setFont"; streamKey: string; fontFamily?: string; fontSize?: number }
   | { type: "setPendingModifiers"; streamKey: string; pendingModifiers: PendingTerminalModifiers }
   | { type: "setSwipeGesturesEnabled"; streamKey: string; enabled: boolean }
@@ -135,6 +141,7 @@ function createMountMessage(input: {
   streamKey: string;
   initialSnapshot: TerminalState | null;
   scrollbackLines: number;
+  overrideControlSequences: boolean;
   theme: ITheme;
   fontFamily?: string;
   fontSize?: number;
@@ -146,6 +153,7 @@ function createMountMessage(input: {
     streamKey: input.streamKey,
     initialSnapshot: input.initialSnapshot,
     scrollbackLines: input.scrollbackLines,
+    overrideControlSequences: input.overrideControlSequences,
     theme: input.theme,
     fontFamily: input.fontFamily,
     fontSize: input.fontSize,
@@ -164,6 +172,7 @@ export default function WebViewTerminalEmulator({
     cursor: "#e6e6e6",
   },
   scrollbackLines,
+  overrideControlSequences = true,
   fontFamily,
   fontSize,
   swipeGesturesEnabled = false,
@@ -202,6 +211,7 @@ export default function WebViewTerminalEmulator({
     streamKey,
     initialSnapshot,
     scrollbackLines,
+    overrideControlSequences,
     theme: xtermTheme,
     fontFamily,
     fontSize,
@@ -212,6 +222,7 @@ export default function WebViewTerminalEmulator({
     streamKey,
     initialSnapshot,
     scrollbackLines,
+    overrideControlSequences,
     theme: xtermTheme,
     fontFamily,
     fontSize,
@@ -408,6 +419,15 @@ export default function WebViewTerminalEmulator({
     if (!mountRequestedStreamKeyRef.current) return;
     sendToWebView({ type: "setScrollback", streamKey, lines: scrollbackLines });
   }, [scrollbackLines, sendToWebView, streamKey]);
+
+  useEffect(() => {
+    if (!mountRequestedStreamKeyRef.current) return;
+    sendToWebView({
+      type: "setOverrideControlSequences",
+      streamKey,
+      overrideControlSequences,
+    });
+  }, [overrideControlSequences, sendToWebView, streamKey]);
 
   useEffect(() => {
     if (!mountRequestedStreamKeyRef.current) return;

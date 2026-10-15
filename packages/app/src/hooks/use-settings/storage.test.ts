@@ -394,6 +394,23 @@ describe("loadAppSettingsFromStorage", () => {
     expect(result.terminalScrollbackLines).toBe(42_000);
   });
 
+  it("overrides terminal control sequences by default", async () => {
+    const result = await loadAppSettingsFromStorage(makeDeps());
+    expect(result.terminalOverrideControlSequences).toBe(true);
+  });
+
+  it("loads the terminal control-sequence override preference", async () => {
+    const deps = makeDeps({
+      storage: createInMemoryKeyValueStorage({
+        [APP_SETTINGS_KEY]: JSON.stringify({ terminalOverrideControlSequences: false }),
+      }),
+    });
+
+    const result = await loadAppSettingsFromStorage(deps);
+
+    expect(result.terminalOverrideControlSequences).toBe(false);
+  });
+
   it("loads configured workspace title source from app settings", async () => {
     const deps = makeDeps({
       storage: createInMemoryKeyValueStorage({

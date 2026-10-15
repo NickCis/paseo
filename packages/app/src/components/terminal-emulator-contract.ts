@@ -36,6 +36,8 @@ export interface TerminalEmulatorProps {
   testId?: string;
   xtermTheme?: ITheme;
   scrollbackLines: number;
+  /** When true, claim Ctrl+C/V/F for clipboard/find. Default true. */
+  overrideControlSequences?: boolean;
   fontFamily?: string;
   fontSize?: number;
   keyboardInset?: number;

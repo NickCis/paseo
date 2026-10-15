@@ -22,6 +22,7 @@ import {
   normalizeDomTerminalKey,
   normalizeTerminalTransportKey,
   resolveMacTerminalEditingShortcut,
+  resolveTerminalClipboardShortcut,
   shouldInterceptDomTerminalKey,
 } from "@/utils/terminal-keys";
 import { renderTerminalSnapshotToAnsi } from "./terminal-snapshot";
@@ -30,7 +31,7 @@ import {
   type TerminalLocalFileLinkSource,
   type TerminalLocalFileLinkTarget,
 } from "../local-links/terminal-local-link-provider";
-import { isFindShortcut, type FindShortcutPlatform } from "@/pane-find/find-shortcut";
+import { resolveTerminalFindShortcut, type FindShortcutPlatform } from "@/pane-find/find-shortcut";
 import { isMacUserAgent } from "@/utils/mac-user-agent";
 import { resolveTerminalFontFamily, resolveTerminalFontSize } from "./terminal-font";
 
@@ -180,8 +181,20 @@ function withOverviewRulerBorderHidden(theme: ITheme): ITheme {
   };
 }
 
+export interface TerminalEmulatorRuntimeOptions {
+  isMac?: boolean;
+  /** When true, claim Ctrl+C/V/F for clipboard/find. Default true (historical). */
+  overrideControlSequences?: boolean;
+}
+
 export class TerminalEmulatorRuntime {
-  constructor(private readonly options: FindShortcutPlatform = { isMac: isMacUserAgent() }) {}
+  private readonly options: FindShortcutPlatform;
+  private overrideControlSequences: boolean;
+
+  constructor(options: TerminalEmulatorRuntimeOptions = {}) {
+    this.options = { isMac: options.isMac ?? isMacUserAgent() };
+    this.overrideControlSequences = options.overrideControlSequences ?? true;
+  }
 
   private callbacks: TerminalEmulatorRuntimeCallbacks = {};
   private pendingModifiers: PendingTerminalModifiers = {
@@ -275,6 +288,10 @@ export class TerminalEmulatorRuntime {
     this.pendingModifiers = input.pendingModifiers;
   }
 
+  setOverrideControlSequences(input: { overrideControlSequences: boolean }): void {
+    this.overrideControlSequences = input.overrideControlSequences;
+  }
+
   private loadSearchAddon(terminal: Terminal): void {
     const searchAddon = new SearchAddon({ highlightLimit: FIND_HIGHLIGHT_LIMIT });
     terminal.loadAddon(searchAddon);
@@ -316,23 +333,24 @@ export class TerminalEmulatorRuntime {
 
       if (this.handleFindShortcut(event)) return false;
 
-      if (
-        !this.options.isMac &&
-        event.ctrlKey &&
-        !event.shiftKey &&
-        !event.altKey &&
-        !event.metaKey
-      ) {
-        const key = event.key.toLowerCase();
+      if (!this.options.isMac) {
+        const clipboardAction = resolveTerminalClipboardShortcut({
+          key: event.key,
+          ctrlKey: event.ctrlKey,
+          shiftKey: event.shiftKey,
+          altKey: event.altKey,
+          metaKey: event.metaKey,
+          overrideControlSequences: this.overrideControlSequences,
+        });
 
-        // Ctrl+C: copy selection to clipboard if text is selected, otherwise let xterm send SIGINT
-        if (key === "c" && terminal.hasSelection()) {
+        // Copy only when text is selected; without a selection the chord falls through to xterm.
+        if (clipboardAction === "copy" && terminal.hasSelection()) {
+          event.preventDefault();
           void navigator.clipboard.writeText(terminal.getSelection());
           return false;
         }
 
-        // Ctrl+V: paste from clipboard into terminal
-        if (key === "v") {
+        if (clipboardAction === "paste") {
           event.preventDefault();
           void navigator.clipboard.readText().then((text) => {
             if (text) {
@@ -342,7 +360,15 @@ export class TerminalEmulatorRuntime {
           });
           return false;
         }
+      }
 
+      if (
+        !this.options.isMac &&
+        event.ctrlKey &&
+        !event.shiftKey &&
+        !event.altKey &&
+        !event.metaKey
+      ) {
         return true;
       }
 
@@ -393,7 +419,12 @@ export class TerminalEmulatorRuntime {
   }
 
   private handleFindShortcut(event: KeyboardEvent): boolean {
-    if (!isFindShortcut(event, this.options) || !this.callbacks.onFindRequest) return false;
+    if (
+      !resolveTerminalFindShortcut(event, this.options, this.overrideControlSequences) ||
+      !this.callbacks.onFindRequest
+    ) {
+      return false;
+    }
     event.preventDefault();
     event.stopPropagation();
     this.callbacks.onFindRequest();

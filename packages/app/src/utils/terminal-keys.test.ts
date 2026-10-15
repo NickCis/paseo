@@ -9,8 +9,86 @@ import {
   normalizeTerminalTransportKey,
   resolveMacTerminalEditingShortcut,
   resolvePendingModifierDataInput,
+  resolveTerminalClipboardShortcut,
   shouldInterceptDomTerminalKey,
 } from "./terminal-keys";
+
+describe("resolveTerminalClipboardShortcut", () => {
+  const chord = (
+    key: string,
+    modifiers: Partial<{
+      ctrlKey: boolean;
+      shiftKey: boolean;
+      altKey: boolean;
+      metaKey: boolean;
+      overrideControlSequences: boolean;
+    }>,
+  ) => ({
+    key,
+    ctrlKey: false,
+    shiftKey: false,
+    altKey: false,
+    metaKey: false,
+    overrideControlSequences: true,
+    ...modifiers,
+  });
+
+  it("with overrides on, maps Ctrl+C / Ctrl+V and leaves Shift+Insert alone", () => {
+    expect(resolveTerminalClipboardShortcut(chord("c", { ctrlKey: true }))).toBe("copy");
+    expect(resolveTerminalClipboardShortcut(chord("v", { ctrlKey: true }))).toBe("paste");
+    expect(resolveTerminalClipboardShortcut(chord("Insert", { shiftKey: true }))).toBe(null);
+    expect(resolveTerminalClipboardShortcut(chord("C", { ctrlKey: true, shiftKey: true }))).toBe(
+      null,
+    );
+  });
+
+  it("with overrides off, maps Ctrl+Shift+C and Shift+Insert and leaves Ctrl+V alone", () => {
+    expect(
+      resolveTerminalClipboardShortcut(
+        chord("C", { ctrlKey: true, shiftKey: true, overrideControlSequences: false }),
+      ),
+    ).toBe("copy");
+    expect(
+      resolveTerminalClipboardShortcut(
+        chord("Insert", { shiftKey: true, overrideControlSequences: false }),
+      ),
+    ).toBe("paste");
+    expect(
+      resolveTerminalClipboardShortcut(
+        chord("v", { ctrlKey: true, overrideControlSequences: false }),
+      ),
+    ).toBe(null);
+    expect(
+      resolveTerminalClipboardShortcut(
+        chord("c", { ctrlKey: true, overrideControlSequences: false }),
+      ),
+    ).toBe(null);
+  });
+
+  it("leaves Ctrl+Shift+V to the native paste", () => {
+    expect(resolveTerminalClipboardShortcut(chord("V", { ctrlKey: true, shiftKey: true }))).toBe(
+      null,
+    );
+    expect(
+      resolveTerminalClipboardShortcut(
+        chord("V", { ctrlKey: true, shiftKey: true, overrideControlSequences: false }),
+      ),
+    ).toBe(null);
+  });
+
+  it("tolerates a missing key without throwing", () => {
+    expect(
+      resolveTerminalClipboardShortcut({
+        key: undefined as unknown as string,
+        ctrlKey: true,
+        shiftKey: false,
+        altKey: false,
+        metaKey: false,
+        overrideControlSequences: true,
+      }),
+    ).toBe(null);
+  });
+});
 
 const IPAD_UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15";

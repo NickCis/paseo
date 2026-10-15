@@ -2209,6 +2209,11 @@ export const es: TranslationResources = {
         description: "Líneas mantenidas en el búfer de terminal incorporado",
         accessibilityLabel: "Líneas del historial de terminal",
       },
+      terminalOverrideControlSequences: {
+        label: "Anular secuencias de control",
+        description:
+          "Usa Ctrl+C, Ctrl+V y Ctrl+F para copiar, pegar y buscar en lugar de enviarlas al shell. Desactívalo para el comportamiento estilo readline de Ctrl+F y Ctrl+V; copiar y pegar usan Ctrl+Shift+C y Shift+Insert.",
+      },
       autoExpandReasoning: {
         label: "Siempre expandir razonamiento",
         description:

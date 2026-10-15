@@ -81,6 +81,12 @@ export interface AppSettings {
   sendBehavior: SendBehavior;
   serviceUrlBehavior: ServiceUrlBehavior;
   terminalScrollbackLines: number;
+  /**
+   * When true (default), the terminal claims Ctrl+C/V/F for copy/paste/find.
+   * When false, those keys go to the shell; copy/paste/find use Ctrl+Shift+C,
+   * Shift+Insert / Ctrl+Shift+V, and Ctrl+Shift+F instead.
+   */
+  terminalOverrideControlSequences: boolean;
   useLegacyTerminalRenderer: boolean;
   uiFontFamily: string; // "" = platform default UI stack
   monoFontFamily: string; // "" = platform default mono stack
@@ -141,6 +147,7 @@ export const DEFAULT_CLIENT_SETTINGS: AppSettings = {
   sendBehavior: "steer",
   serviceUrlBehavior: "ask",
   terminalScrollbackLines: DEFAULT_TERMINAL_SCROLLBACK_LINES,
+  terminalOverrideControlSequences: true,
   useLegacyTerminalRenderer: false,
   uiFontFamily: "",
   monoFontFamily: "",
@@ -222,6 +229,7 @@ const StoredAppSettingsSchema = z
       MIN_TERMINAL_SCROLLBACK_LINES,
       MAX_TERMINAL_SCROLLBACK_LINES,
     ).catch(DEFAULT_TERMINAL_SCROLLBACK_LINES),
+    terminalOverrideControlSequences: z.boolean().catch(true),
     useLegacyTerminalRenderer: z.boolean().catch(false),
     uiFontFamily: sanitizedFontFamily().catch(""),
     monoFontFamily: sanitizedFontFamily().catch(""),
