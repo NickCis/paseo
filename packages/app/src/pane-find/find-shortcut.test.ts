@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { isFindShortcut } from "./find-shortcut";
+import {
+  isFindShortcut,
+  isTerminalFindShortcut,
+  resolveTerminalFindShortcut,
+} from "./find-shortcut";
 
 const MAC = { isMac: true };
 const NON_MAC = { isMac: false };
@@ -63,4 +67,45 @@ it("matches an uppercase F from a shifted keyboard layout", () => {
 it("ignores other keys", () => {
   expect(isFindShortcut(keydown({ key: "g", metaKey: true }), MAC)).toBe(false);
   expect(isFindShortcut(keydown({ key: "g", ctrlKey: true }), NON_MAC)).toBe(false);
+});
+
+describe("terminal Find", () => {
+  it("keeps Command+F on macOS", () => {
+    expect(isTerminalFindShortcut(keydown({ metaKey: true }), MAC)).toBe(true);
+    expect(isTerminalFindShortcut(keydown({ ctrlKey: true }), MAC)).toBe(false);
+  });
+
+  it("leaves Control+F to the shell off macOS", () => {
+    expect(isTerminalFindShortcut(keydown({ ctrlKey: true }), NON_MAC)).toBe(false);
+  });
+
+  it("opens Find with Control+Shift+F off macOS", () => {
+    expect(isTerminalFindShortcut(keydown({ ctrlKey: true, shiftKey: true }), NON_MAC)).toBe(true);
+    expect(
+      isTerminalFindShortcut(keydown({ key: "F", ctrlKey: true, shiftKey: true }), NON_MAC),
+    ).toBe(true);
+  });
+
+  it("ignores Control+Shift+F with Alt or Meta", () => {
+    expect(
+      isTerminalFindShortcut(keydown({ ctrlKey: true, shiftKey: true, altKey: true }), NON_MAC),
+    ).toBe(false);
+    expect(
+      isTerminalFindShortcut(keydown({ ctrlKey: true, shiftKey: true, metaKey: true }), NON_MAC),
+    ).toBe(false);
+  });
+
+  it("with overrides on, uses Control+F off macOS", () => {
+    expect(resolveTerminalFindShortcut(keydown({ ctrlKey: true }), NON_MAC, true)).toBe(true);
+    expect(
+      resolveTerminalFindShortcut(keydown({ ctrlKey: true, shiftKey: true }), NON_MAC, true),
+    ).toBe(false);
+  });
+
+  it("with overrides off, uses Control+Shift+F off macOS", () => {
+    expect(resolveTerminalFindShortcut(keydown({ ctrlKey: true }), NON_MAC, false)).toBe(false);
+    expect(
+      resolveTerminalFindShortcut(keydown({ ctrlKey: true, shiftKey: true }), NON_MAC, false),
+    ).toBe(true);
+  });
 });

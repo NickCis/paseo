@@ -200,13 +200,36 @@ describe("terminal-emulator-runtime", () => {
     { isMac: true, ctrlKey: false, metaKey: true, shiftKey: true, opensFind: false },
     { isMac: true, ctrlKey: false, metaKey: true, altKey: true, opensFind: false },
     { isMac: false, ctrlKey: true, metaKey: false, shiftKey: true, opensFind: false },
+    {
+      isMac: false,
+      ctrlKey: true,
+      metaKey: false,
+      shiftKey: true,
+      overrideControlSequences: false,
+      opensFind: true,
+    },
+    {
+      isMac: false,
+      ctrlKey: true,
+      metaKey: false,
+      overrideControlSequences: false,
+      opensFind: false,
+    },
     { isMac: false, ctrlKey: true, metaKey: false, altKey: true, opensFind: false },
     { isMac: true, ctrlKey: true, metaKey: true, opensFind: false },
     { isMac: false, ctrlKey: true, metaKey: true, opensFind: false },
   ])(
-    "routes Find with isMac=$isMac ctrl=$ctrlKey meta=$metaKey shift=$shiftKey alt=$altKey",
-    ({ isMac, ctrlKey, metaKey, shiftKey = false, altKey = false, opensFind }) => {
-      const runtime = new TerminalEmulatorRuntime({ isMac });
+    "routes Find with isMac=$isMac ctrl=$ctrlKey meta=$metaKey shift=$shiftKey alt=$altKey override=$overrideControlSequences",
+    ({
+      isMac,
+      ctrlKey,
+      metaKey,
+      shiftKey = false,
+      altKey = false,
+      overrideControlSequences = true,
+      opensFind,
+    }) => {
+      const runtime = new TerminalEmulatorRuntime({ isMac, overrideControlSequences });
       let findRequests = 0;
       let prevented = false;
       let stopped = false;
@@ -250,6 +273,111 @@ describe("terminal-emulator-runtime", () => {
       expect(stopped).toBe(opensFind);
     },
   );
+
+  it("with overrides off, copies on Ctrl+Shift+C and pastes on Shift+Insert", async () => {
+    const writeText = vi.fn(async (_text: string) => {});
+    const readText = vi.fn(async () => "pasted");
+    vi.stubGlobal("navigator", { clipboard: { writeText, readText } });
+    try {
+      const runtime = new TerminalEmulatorRuntime({
+        isMac: false,
+        overrideControlSequences: false,
+      });
+      let selected = true;
+      const paste = vi.fn();
+      let handler: ((event: KeyboardEvent) => boolean | undefined) | undefined;
+      runtime.attachKeyEventHandler({
+        attachCustomKeyEventHandler: (next) => {
+          handler = next;
+        },
+        hasSelection: () => selected,
+        getSelection: () => "selected text",
+        paste,
+        input: () => {},
+        scrollToBottom: () => {},
+      });
+      const keydown = (init: { key: string; ctrlKey?: boolean; shiftKey?: boolean }) => {
+        const event = {
+          type: "keydown",
+          key: init.key,
+          ctrlKey: init.ctrlKey ?? false,
+          shiftKey: init.shiftKey ?? false,
+          altKey: false,
+          metaKey: false,
+          isComposing: false,
+          preventDefault: vi.fn(),
+          stopPropagation: vi.fn(),
+        };
+        return { event, passedToXterm: handler?.(event as unknown as KeyboardEvent) };
+      };
+
+      const copy = keydown({ key: "C", ctrlKey: true, shiftKey: true });
+      expect(copy.passedToXterm).toBe(false);
+      expect(copy.event.preventDefault).toHaveBeenCalled();
+      expect(writeText).toHaveBeenCalledWith("selected text");
+
+      selected = false;
+      writeText.mockClear();
+      const copyWithoutSelection = keydown({ key: "C", ctrlKey: true, shiftKey: true });
+      expect(copyWithoutSelection.passedToXterm).toBe(true);
+      expect(writeText).not.toHaveBeenCalled();
+
+      const insert = keydown({ key: "Insert", shiftKey: true });
+      expect(insert.passedToXterm).toBe(false);
+      expect(insert.event.preventDefault).toHaveBeenCalled();
+      await vi.waitFor(() => expect(paste).toHaveBeenCalledWith("pasted"));
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("with overrides on, pastes on Ctrl+V and leaves Shift+Insert to xterm", async () => {
+    const writeText = vi.fn(async (_text: string) => {});
+    const readText = vi.fn(async () => "pasted");
+    vi.stubGlobal("navigator", { clipboard: { writeText, readText } });
+    try {
+      const runtime = new TerminalEmulatorRuntime({ isMac: false });
+      const paste = vi.fn();
+      let handler: ((event: KeyboardEvent) => boolean | undefined) | undefined;
+      runtime.attachKeyEventHandler({
+        attachCustomKeyEventHandler: (next) => {
+          handler = next;
+        },
+        hasSelection: () => false,
+        getSelection: () => "",
+        paste,
+        input: () => {},
+        scrollToBottom: () => {},
+      });
+      const event = {
+        type: "keydown",
+        key: "v",
+        ctrlKey: true,
+        shiftKey: false,
+        altKey: false,
+        metaKey: false,
+        isComposing: false,
+        preventDefault: vi.fn(),
+        stopPropagation: vi.fn(),
+      };
+      expect(handler?.(event as unknown as KeyboardEvent)).toBe(false);
+      await vi.waitFor(() => expect(paste).toHaveBeenCalledWith("pasted"));
+
+      paste.mockClear();
+      const insert = {
+        ...event,
+        key: "Insert",
+        ctrlKey: false,
+        shiftKey: true,
+        preventDefault: vi.fn(),
+        stopPropagation: vi.fn(),
+      };
+      expect(handler?.(insert as unknown as KeyboardEvent)).toBe(true);
+      expect(paste).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 
   it("drains contiguous plain writes without waiting for each commit, gating a clear behind them", () => {
     const { runtime, terminal, writeCallbacks, writeTexts } = createRuntimeWithTerminal();

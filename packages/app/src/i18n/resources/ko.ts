@@ -2378,6 +2378,11 @@ export const ko: TranslationResources = {
         description: "내장 터미널 버퍼에 보관되는 줄 수",
         accessibilityLabel: "터미널 스크롤백 줄 수",
       },
+      terminalOverrideControlSequences: {
+        label: "제어 시퀀스 재정의",
+        description:
+          "Ctrl+C/V/F를 셸로 보내지 않고 복사·붙여넣기·찾기에 사용합니다. 끄면 readline 스타일 Ctrl+F/V가 되고, 복사와 붙여넣기는 Ctrl+Shift+C와 Shift+Insert입니다.",
+      },
       autoExpandReasoning: {
         label: "추론 항상 펼치기",
         description: "에이전트의 사고 및 추론 블록을 기본적으로 모두 펼쳐 표시합니다.",

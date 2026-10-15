@@ -12,7 +12,7 @@ afterEach(() => {
   runtime?.unmount();
   root?.remove();
 });
-function mount(options?: { isMac: boolean }) {
+function mount(options?: { isMac?: boolean; overrideControlSequences?: boolean }) {
   root = document.createElement("div");
   Object.assign(root.style, { width: "480px", height: "200px" });
   const host = document.createElement("div");
@@ -164,8 +164,42 @@ test("preserves inspection through multiple real parser turns of queued output",
   expect(term.getSelection()).toBe("needle");
 });
 
-test.each([true, false])("routes Find and shell input through xterm with isMac=%s", (isMac) => {
-  mount({ isMac });
+test.each([true, false])(
+  "with overrides on, routes Find through Ctrl/Cmd+F with isMac=%s",
+  (isMac) => {
+    mount({ isMac, overrideControlSequences: true });
+    const input: string[] = [];
+    let findRequests = 0;
+    runtime.setCallbacks({
+      callbacks: {
+        onInput: (data) => {
+          input.push(data);
+        },
+        onFindRequest: () => {
+          findRequests += 1;
+        },
+      },
+    });
+    const textarea = root.querySelector("textarea")!;
+    textarea.focus();
+    const findEvent = new KeyboardEvent("keydown", {
+      key: "f",
+      code: "KeyF",
+      keyCode: 70,
+      metaKey: isMac,
+      ctrlKey: !isMac,
+      bubbles: true,
+      cancelable: true,
+    });
+    textarea.dispatchEvent(findEvent);
+    expect(findRequests).toBe(1);
+    expect(findEvent.defaultPrevented).toBe(true);
+    expect(input).toEqual([]);
+  },
+);
+
+test("with overrides off, leaves Ctrl+F to the shell and opens Find with Ctrl+Shift+F", () => {
+  mount({ isMac: false, overrideControlSequences: false });
   const input: string[] = [];
   let findRequests = 0;
   runtime.setCallbacks({
@@ -189,17 +223,18 @@ test.each([true, false])("routes Find and shell input through xterm with isMac=%
     cancelable: true,
   });
   textarea.dispatchEvent(ctrlF);
-  expect(findRequests).toBe(isMac ? 0 : 1);
-  expect(input).toEqual(isMac ? ["\x06"] : []);
-  const metaF = new KeyboardEvent("keydown", {
+  expect(findRequests).toBe(0);
+  expect(input).toEqual(["\x06"]);
+  const findEvent = new KeyboardEvent("keydown", {
     key: "f",
     code: "KeyF",
     keyCode: 70,
-    metaKey: true,
+    ctrlKey: true,
+    shiftKey: true,
     bubbles: true,
     cancelable: true,
   });
-  textarea.dispatchEvent(metaF);
+  textarea.dispatchEvent(findEvent);
   expect(findRequests).toBe(1);
-  expect(metaF.defaultPrevented).toBe(isMac);
+  expect(findEvent.defaultPrevented).toBe(true);
 });

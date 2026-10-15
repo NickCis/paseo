@@ -2490,6 +2490,11 @@ export const en = {
         description: "Lines kept in the built-in terminal buffer",
         accessibilityLabel: "Terminal scrollback lines",
       },
+      terminalOverrideControlSequences: {
+        label: "Override control sequences",
+        description:
+          "Use Ctrl+C, Ctrl+V, and Ctrl+F for copy, paste, and find instead of sending them to the shell. Turn off for readline-style Ctrl+F and Ctrl+V; copy and paste use Ctrl+Shift+C and Shift+Insert.",
+      },
       autoExpandReasoning: {
         label: "Always expand reasoning",
         description: "Show agent thinking and chain-of-thought blocks fully expanded by default",

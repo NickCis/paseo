@@ -22,6 +22,7 @@ import {
   normalizeDomTerminalKey,
   normalizeTerminalTransportKey,
   resolveMacTerminalEditingShortcut,
+  resolveTerminalClipboardShortcut,
   shouldInterceptDomTerminalKey,
 } from "@/utils/terminal-keys";
 import { renderTerminalSnapshotToAnsi } from "./terminal-snapshot";
@@ -30,7 +31,7 @@ import {
   type TerminalLocalFileLinkSource,
   type TerminalLocalFileLinkTarget,
 } from "../local-links/terminal-local-link-provider";
-import { isFindShortcut, type FindShortcutPlatform } from "@/pane-find/find-shortcut";
+import { resolveTerminalFindShortcut, type FindShortcutPlatform } from "@/pane-find/find-shortcut";
 import { isMacUserAgent } from "@/utils/mac-user-agent";
 import { resolveTerminalFontFamily, resolveTerminalFontSize } from "./terminal-font";
 import { imageExtension, readTerminalFile, type TerminalFile } from "../file-paste";
@@ -190,6 +191,13 @@ export interface TerminalClipboard {
   writeText(text: string): Promise<void>;
 }
 
+export interface TerminalEmulatorRuntimeOptions {
+  isMac?: boolean;
+  /** When true, claim Ctrl+C/V/F for clipboard/find. Default true (historical). */
+  overrideControlSequences?: boolean;
+  clipboard?: TerminalClipboard;
+}
+
 const browserClipboard: TerminalClipboard = {
   readText: () => navigator.clipboard.readText(),
   read: () => navigator.clipboard.read(),
@@ -225,10 +233,15 @@ function findFileOnlyPaste(transfer: DataTransfer | null): File | null {
 }
 
 export class TerminalEmulatorRuntime {
-  constructor(
-    private readonly options: FindShortcutPlatform = { isMac: isMacUserAgent() },
-    private readonly clipboard: TerminalClipboard = browserClipboard,
-  ) {}
+  private readonly options: FindShortcutPlatform;
+  private overrideControlSequences: boolean;
+  private readonly clipboard: TerminalClipboard;
+
+  constructor(options: TerminalEmulatorRuntimeOptions = {}) {
+    this.options = { isMac: options.isMac ?? isMacUserAgent() };
+    this.overrideControlSequences = options.overrideControlSequences ?? true;
+    this.clipboard = options.clipboard ?? browserClipboard;
+  }
 
   private callbacks: TerminalEmulatorRuntimeCallbacks = {};
   private pendingModifiers: PendingTerminalModifiers = {
@@ -322,6 +335,10 @@ export class TerminalEmulatorRuntime {
     this.pendingModifiers = input.pendingModifiers;
   }
 
+  setOverrideControlSequences(input: { overrideControlSequences: boolean }): void {
+    this.overrideControlSequences = input.overrideControlSequences;
+  }
+
   private loadSearchAddon(terminal: Terminal): void {
     const searchAddon = new SearchAddon({ highlightLimit: FIND_HIGHLIGHT_LIMIT });
     terminal.loadAddon(searchAddon);
@@ -363,6 +380,30 @@ export class TerminalEmulatorRuntime {
 
       if (this.handleFindShortcut(event)) return false;
 
+      if (!this.options.isMac) {
+        const clipboardAction = resolveTerminalClipboardShortcut({
+          key: event.key,
+          ctrlKey: event.ctrlKey,
+          shiftKey: event.shiftKey,
+          altKey: event.altKey,
+          metaKey: event.metaKey,
+          overrideControlSequences: this.overrideControlSequences,
+        });
+
+        // Copy only when text is selected; without a selection the chord falls through to xterm.
+        if (clipboardAction === "copy" && terminal.hasSelection()) {
+          event.preventDefault();
+          void this.clipboard.writeText(terminal.getSelection());
+          return false;
+        }
+
+        if (clipboardAction === "paste") {
+          event.preventDefault();
+          this.pasteClipboard(terminal);
+          return false;
+        }
+      }
+
       if (
         !this.options.isMac &&
         event.ctrlKey &&
@@ -370,21 +411,6 @@ export class TerminalEmulatorRuntime {
         !event.altKey &&
         !event.metaKey
       ) {
-        const key = event.key.toLowerCase();
-
-        // Ctrl+C: copy selection to clipboard if text is selected, otherwise let xterm send SIGINT
-        if (key === "c" && terminal.hasSelection()) {
-          void this.clipboard.writeText(terminal.getSelection());
-          return false;
-        }
-
-        // Ctrl+V: paste clipboard text, or the clipboard image when there is no text
-        if (key === "v") {
-          event.preventDefault();
-          this.pasteClipboard(terminal);
-          return false;
-        }
-
         return true;
       }
 
@@ -435,7 +461,12 @@ export class TerminalEmulatorRuntime {
   }
 
   private handleFindShortcut(event: KeyboardEvent): boolean {
-    if (!isFindShortcut(event, this.options) || !this.callbacks.onFindRequest) return false;
+    if (
+      !resolveTerminalFindShortcut(event, this.options, this.overrideControlSequences) ||
+      !this.callbacks.onFindRequest
+    ) {
+      return false;
+    }
     event.preventDefault();
     event.stopPropagation();
     this.callbacks.onFindRequest();

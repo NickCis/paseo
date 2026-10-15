@@ -137,10 +137,10 @@ function createTerminalHost(input: CreateTerminalHostInput): MountedTerminal {
   const openedUrls: string[] = [];
   const clipboard = new FakeClipboard();
   const filePastes: Promise<TerminalFile | null>[] = [];
-  const runtime = new TerminalEmulatorRuntime(
-    input.isMac === undefined ? undefined : { isMac: input.isMac },
+  const runtime = new TerminalEmulatorRuntime({
+    ...(input.isMac === undefined ? {} : { isMac: input.isMac }),
     clipboard,
-  );
+  });
   runtime.setCallbacks({
     callbacks: {
       onInput: (data) => {

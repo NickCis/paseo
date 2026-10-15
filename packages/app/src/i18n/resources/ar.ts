@@ -2401,6 +2401,11 @@ export const ar: TranslationResources = {
         description: "يتم الاحتفاظ بالخطوط في المخزن المؤقت الطرفي المدمج",
         accessibilityLabel: "خطوط التمرير Terminal",
       },
+      terminalOverrideControlSequences: {
+        label: "تجاوز تسلسلات التحكم",
+        description:
+          "استخدم Ctrl+C وCtrl+V وCtrl+F للنسخ واللصق والبحث بدل إرسالها إلى الصدفة. عطّل هذا للحصول على سلوك readline لـ Ctrl+F وCtrl+V؛ النسخ واللصق يستخدمان Ctrl+Shift+C وShift+Insert.",
+      },
       autoExpandReasoning: {
         label: "عرض التفكير دائماً",
         description: "إظهار تفكير الوكيل وخطوات الاستدلال بشكل كامل بشكل افتراضي",

@@ -1211,6 +1211,7 @@ export function TerminalPane({
             testId="terminal-surface"
             xtermTheme={xtermTheme}
             scrollbackLines={settings.terminalScrollbackLines}
+            overrideControlSequences={settings.terminalOverrideControlSequences}
             fontFamily={terminalFontFamily}
             fontSize={settings.codeFontSize}
             keyboardInset={keyboardInset}

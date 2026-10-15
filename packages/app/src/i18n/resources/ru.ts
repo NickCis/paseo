@@ -2404,6 +2404,11 @@ export const ru: TranslationResources = {
         description: "Количество строк, сохраняемых во встроенном буфере терминала",
         accessibilityLabel: "Количество строк в буфере прокрутки терминала",
       },
+      terminalOverrideControlSequences: {
+        label: "Перехватывать управляющие последовательности",
+        description:
+          "Использовать Ctrl+C, Ctrl+V и Ctrl+F для копирования, вставки и поиска вместо отправки в оболочку. Выключите для поведения readline: Ctrl+F и Ctrl+V; копирование и вставка — Ctrl+Shift+C и Shift+Insert.",
+      },
       autoExpandReasoning: {
         label: "Всегда разворачивать размышления",
         description:

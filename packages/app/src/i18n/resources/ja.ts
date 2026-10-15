@@ -2385,6 +2385,11 @@ export const ja: TranslationResources = {
         description: "組み込みターミナルバッファに保持する行数",
         accessibilityLabel: "ターミナルスクロールバック行数",
       },
+      terminalOverrideControlSequences: {
+        label: "制御シーケンスを上書き",
+        description:
+          "Ctrl+C/V/F をシェルに送らず、コピー・貼り付け・検索に使います。オフにすると readline 風の Ctrl+F と Ctrl+V になり、コピーと貼り付けは Ctrl+Shift+C と Shift+Insert です。",
+      },
       autoExpandReasoning: {
         label: "常に思考プロセスを展開",
         description: "デフォルトでAIのエージェント思考・推論ブロックを完全に展開して表示します",
