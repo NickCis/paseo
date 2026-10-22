@@ -135,7 +135,7 @@ export function shouldInterceptDomTerminalKey(args: {
   return false;
 }
 
-export type TerminalClipboardAction = "copy" | "paste";
+export type TerminalClipboardAction = "copy" | "paste" | "paste-selection";
 
 // Non-macOS clipboard chords the terminal claims before xterm sends them to the PTY.
 // Copy only applies when text is selected; otherwise the chord falls through (caller decides).
@@ -152,15 +152,18 @@ export function resolveTerminalClipboardShortcut(args: {
     return null;
   }
   const key = args.key.toLowerCase();
+  // Shift+Insert is a terminal editing chord, not a control sequence, so it behaves the
+  // same in both modes. The runtime prefers the terminal selection and falls back to the
+  // clipboard when no selection has been captured.
+  if (!args.ctrlKey && args.shiftKey && key === "insert") return "paste-selection";
   if (args.overrideControlSequences) {
     // Historical: claim Ctrl+C / Ctrl+V so the shell never sees those sequences.
     if (args.ctrlKey && !args.shiftKey && key === "c") return "copy";
     if (args.ctrlKey && !args.shiftKey && key === "v") return "paste";
     return null;
   }
-  // Shell keeps Ctrl+C / Ctrl+V. Emulator clipboard uses Ctrl+Shift+C and Shift+Insert.
+  // Shell keeps Ctrl+C / Ctrl+V. Emulator copy uses Ctrl+Shift+C.
   if (args.ctrlKey && args.shiftKey && key === "c") return "copy";
-  if (!args.ctrlKey && args.shiftKey && key === "insert") return "paste";
   return null;
 }
 

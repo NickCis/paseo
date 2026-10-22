@@ -35,6 +35,9 @@ type BrowserTerminal = TerminalSize & {
   input: (data: string, wasUserInput?: boolean) => void;
   refresh: (start: number, end: number) => void;
   reset: () => void;
+  select: (column: number, row: number, length: number) => void;
+  clearSelection: () => void;
+  getSelection: () => string;
 };
 
 interface MountedTerminal {
@@ -526,6 +529,31 @@ describe("terminal emulator runtime in a real browser", () => {
     await waitFor({ predicate: () => mounted.inputs.length > 0 });
     expect(mounted.inputs).toEqual(["echo hi"]);
     expect(mounted.filePastes).toEqual([]);
+  });
+
+  it("pastes the terminal selection and remembers it across repeated Shift+Insert presses", async () => {
+    await page.viewport(900, 600);
+    const mounted = createTerminalHost({ width: 720, height: 360, isMac: false });
+
+    await waitFor({ predicate: () => mounted.sizes.length > 0 });
+    await writeLines(mounted, ["hello world"]);
+    const terminal = getBrowserTerminal();
+
+    terminal.select(0, 0, 5);
+    dispatchTerminalKey({ host: mounted.host, key: "Insert", shiftKey: true });
+    await waitFor({ predicate: () => mounted.inputs.length >= 1 });
+    expect(mounted.inputs.at(-1)).toBe("hello");
+    expect(terminal.getSelection()).toBe("");
+
+    dispatchTerminalKey({ host: mounted.host, key: "Insert", shiftKey: true });
+    await waitFor({ predicate: () => mounted.inputs.length >= 2 });
+    expect(mounted.inputs.at(-1)).toBe("hello");
+
+    terminal.select(6, 0, 5);
+    terminal.clearSelection();
+    dispatchTerminalKey({ host: mounted.host, key: "Insert", shiftKey: true });
+    await waitFor({ predicate: () => mounted.inputs.length >= 3 });
+    expect(mounted.inputs.at(-1)).toBe("world");
   });
 
   it("refreshes visible rows on a forced same-size resize", async () => {

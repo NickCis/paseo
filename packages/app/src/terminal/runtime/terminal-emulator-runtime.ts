@@ -118,6 +118,7 @@ export function createTerminalResizeEvent(input: {
 
 interface TerminalEmulatorRuntimeDisposables {
   disposeInput: () => void;
+  disposeSelectionChange: () => void;
   disconnectResizeObserver: () => void;
   removeWindowResize: () => void;
   removeWindowFocus: () => void;
@@ -249,6 +250,9 @@ export class TerminalEmulatorRuntime {
     shift: false,
     alt: false,
   };
+  // Shift+Insert pastes the most recent terminal selection. xterm clears the live
+  // selection on paste, so keep the text to make repeated presses behave like PRIMARY.
+  private lastSelection = "";
   private terminal: Terminal | null = null;
   private fitAddon: FitAddon | null = null;
   private searchAddon: SearchAddon | null = null;
@@ -339,6 +343,60 @@ export class TerminalEmulatorRuntime {
     this.overrideControlSequences = input.overrideControlSequences;
   }
 
+  private async pasteFromClipboard(terminal: Pick<Terminal, "paste">): Promise<void> {
+    const text = await this.clipboard.readText().catch(() => "");
+    if (text) {
+      terminal.paste(text);
+    }
+  }
+
+  private handleClipboardShortcut(
+    event: KeyboardEvent,
+    terminal: Pick<Terminal, "hasSelection" | "getSelection" | "paste">,
+  ): boolean {
+    if (this.options.isMac) {
+      return false;
+    }
+
+    const clipboardAction = resolveTerminalClipboardShortcut({
+      key: event.key,
+      ctrlKey: event.ctrlKey,
+      shiftKey: event.shiftKey,
+      altKey: event.altKey,
+      metaKey: event.metaKey,
+      overrideControlSequences: this.overrideControlSequences,
+    });
+
+    // Copy only when text is selected; without a selection the chord falls through to xterm.
+    if (clipboardAction === "copy" && terminal.hasSelection()) {
+      event.preventDefault();
+      void this.clipboard.writeText(terminal.getSelection());
+      return true;
+    }
+
+    if (clipboardAction === "paste-selection") {
+      event.preventDefault();
+      const selectedText = terminal.hasSelection() ? terminal.getSelection() : "";
+      if (selectedText) {
+        this.lastSelection = selectedText;
+      }
+      if (this.lastSelection) {
+        terminal.paste(this.lastSelection);
+      } else {
+        void this.pasteFromClipboard(terminal);
+      }
+      return true;
+    }
+
+    if (clipboardAction === "paste") {
+      event.preventDefault();
+      this.pasteClipboard(terminal);
+      return true;
+    }
+
+    return false;
+  }
+
   private loadSearchAddon(terminal: Terminal): void {
     const searchAddon = new SearchAddon({ highlightLimit: FIND_HIGHLIGHT_LIMIT });
     terminal.loadAddon(searchAddon);
@@ -380,28 +438,8 @@ export class TerminalEmulatorRuntime {
 
       if (this.handleFindShortcut(event)) return false;
 
-      if (!this.options.isMac) {
-        const clipboardAction = resolveTerminalClipboardShortcut({
-          key: event.key,
-          ctrlKey: event.ctrlKey,
-          shiftKey: event.shiftKey,
-          altKey: event.altKey,
-          metaKey: event.metaKey,
-          overrideControlSequences: this.overrideControlSequences,
-        });
-
-        // Copy only when text is selected; without a selection the chord falls through to xterm.
-        if (clipboardAction === "copy" && terminal.hasSelection()) {
-          event.preventDefault();
-          void this.clipboard.writeText(terminal.getSelection());
-          return false;
-        }
-
-        if (clipboardAction === "paste") {
-          event.preventDefault();
-          this.pasteClipboard(terminal);
-          return false;
-        }
+      if (this.handleClipboardShortcut(event, terminal)) {
+        return false;
       }
 
       if (
@@ -730,6 +768,12 @@ export class TerminalEmulatorRuntime {
 
     fitAndEmitResize({ forceRefresh: true, shouldClaim: false });
 
+    const selectionChangeDisposable = terminal.onSelectionChange(() => {
+      if (terminal.hasSelection()) {
+        this.lastSelection = terminal.getSelection();
+      }
+    });
+
     const inputDisposable = terminal.onData((data) => {
       if (this.suppressInput) {
         return;
@@ -818,6 +862,9 @@ export class TerminalEmulatorRuntime {
       disposeInput: () => {
         inputDisposable.dispose();
       },
+      disposeSelectionChange: () => {
+        selectionChangeDisposable.dispose();
+      },
       disconnectResizeObserver: () => {
         resizeObserver.disconnect();
       },
@@ -866,6 +913,7 @@ export class TerminalEmulatorRuntime {
 
     this.cleanup = () => {
       disposables.disposeInput();
+      disposables.disposeSelectionChange();
       disposables.disconnectResizeObserver();
       disposables.removeWindowResize();
       disposables.removeWindowFocus();
@@ -1085,6 +1133,7 @@ export class TerminalEmulatorRuntime {
       window.__paseoTerminal = undefined;
     }
     this.terminal = null;
+    this.lastSelection = "";
     this.searchAddon = null;
     this.findQuery = "";
     this.findResult = { resultIndex: -1, resultCount: 0 };

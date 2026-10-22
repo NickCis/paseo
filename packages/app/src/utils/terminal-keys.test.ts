@@ -33,16 +33,18 @@ describe("resolveTerminalClipboardShortcut", () => {
     ...modifiers,
   });
 
-  it("with overrides on, maps Ctrl+C / Ctrl+V and leaves Shift+Insert alone", () => {
+  it("with overrides on, maps Ctrl+C / Ctrl+V and Shift+Insert", () => {
     expect(resolveTerminalClipboardShortcut(chord("c", { ctrlKey: true }))).toBe("copy");
     expect(resolveTerminalClipboardShortcut(chord("v", { ctrlKey: true }))).toBe("paste");
-    expect(resolveTerminalClipboardShortcut(chord("Insert", { shiftKey: true }))).toBe(null);
+    expect(resolveTerminalClipboardShortcut(chord("Insert", { shiftKey: true }))).toBe(
+      "paste-selection",
+    );
     expect(resolveTerminalClipboardShortcut(chord("C", { ctrlKey: true, shiftKey: true }))).toBe(
       null,
     );
   });
 
-  it("with overrides off, maps Ctrl+Shift+C and Shift+Insert and leaves Ctrl+V alone", () => {
+  it("with overrides off, maps Ctrl+Shift+C, Shift+Insert, and leaves Ctrl+V alone", () => {
     expect(
       resolveTerminalClipboardShortcut(
         chord("C", { ctrlKey: true, shiftKey: true, overrideControlSequences: false }),
@@ -52,7 +54,7 @@ describe("resolveTerminalClipboardShortcut", () => {
       resolveTerminalClipboardShortcut(
         chord("Insert", { shiftKey: true, overrideControlSequences: false }),
       ),
-    ).toBe("paste");
+    ).toBe("paste-selection");
     expect(
       resolveTerminalClipboardShortcut(
         chord("v", { ctrlKey: true, overrideControlSequences: false }),

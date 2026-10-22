@@ -274,24 +274,24 @@ describe("terminal-emulator-runtime", () => {
     },
   );
 
-  it("with overrides off, copies on Ctrl+Shift+C and pastes on Shift+Insert", async () => {
+  it("with overrides off, copies on Ctrl+Shift+C and pastes the terminal selection on Shift+Insert", async () => {
     const writeText = vi.fn(async (_text: string) => {});
-    const readText = vi.fn(async () => "pasted");
+    const readText = vi.fn(async () => "clipboard text");
     vi.stubGlobal("navigator", { clipboard: { writeText, readText } });
     try {
       const runtime = new TerminalEmulatorRuntime({
         isMac: false,
         overrideControlSequences: false,
       });
-      let selected = true;
+      let selection = "selected text";
       const paste = vi.fn();
       let handler: ((event: KeyboardEvent) => boolean | undefined) | undefined;
       runtime.attachKeyEventHandler({
         attachCustomKeyEventHandler: (next) => {
           handler = next;
         },
-        hasSelection: () => selected,
-        getSelection: () => "selected text",
+        hasSelection: () => selection.length > 0,
+        getSelection: () => selection,
         paste,
         input: () => {},
         scrollToBottom: () => {},
@@ -316,35 +316,45 @@ describe("terminal-emulator-runtime", () => {
       expect(copy.event.preventDefault).toHaveBeenCalled();
       expect(writeText).toHaveBeenCalledWith("selected text");
 
-      selected = false;
+      selection = "";
       writeText.mockClear();
       const copyWithoutSelection = keydown({ key: "C", ctrlKey: true, shiftKey: true });
       expect(copyWithoutSelection.passedToXterm).toBe(true);
       expect(writeText).not.toHaveBeenCalled();
 
+      selection = "selected text";
       const insert = keydown({ key: "Insert", shiftKey: true });
       expect(insert.passedToXterm).toBe(false);
       expect(insert.event.preventDefault).toHaveBeenCalled();
-      await vi.waitFor(() => expect(paste).toHaveBeenCalledWith("pasted"));
+      expect(paste).toHaveBeenCalledWith("selected text");
+      expect(readText).not.toHaveBeenCalled();
+
+      selection = "";
+      paste.mockClear();
+      const repeatedInsert = keydown({ key: "Insert", shiftKey: true });
+      expect(repeatedInsert.passedToXterm).toBe(false);
+      expect(paste).toHaveBeenCalledWith("selected text");
+      expect(readText).not.toHaveBeenCalled();
     } finally {
       vi.unstubAllGlobals();
     }
   });
 
-  it("with overrides on, pastes on Ctrl+V and leaves Shift+Insert to xterm", async () => {
+  it("with overrides on, pastes on Ctrl+V and pastes the terminal selection on Shift+Insert", async () => {
     const writeText = vi.fn(async (_text: string) => {});
-    const readText = vi.fn(async () => "pasted");
+    const readText = vi.fn(async () => "clipboard text");
     vi.stubGlobal("navigator", { clipboard: { writeText, readText } });
     try {
       const runtime = new TerminalEmulatorRuntime({ isMac: false });
+      let selection = "selected text";
       const paste = vi.fn();
       let handler: ((event: KeyboardEvent) => boolean | undefined) | undefined;
       runtime.attachKeyEventHandler({
         attachCustomKeyEventHandler: (next) => {
           handler = next;
         },
-        hasSelection: () => false,
-        getSelection: () => "",
+        hasSelection: () => selection.length > 0,
+        getSelection: () => selection,
         paste,
         input: () => {},
         scrollToBottom: () => {},
@@ -361,7 +371,7 @@ describe("terminal-emulator-runtime", () => {
         stopPropagation: vi.fn(),
       };
       expect(handler?.(event as unknown as KeyboardEvent)).toBe(false);
-      await vi.waitFor(() => expect(paste).toHaveBeenCalledWith("pasted"));
+      await vi.waitFor(() => expect(paste).toHaveBeenCalledWith("clipboard text"));
 
       paste.mockClear();
       const insert = {
@@ -372,8 +382,58 @@ describe("terminal-emulator-runtime", () => {
         preventDefault: vi.fn(),
         stopPropagation: vi.fn(),
       };
-      expect(handler?.(insert as unknown as KeyboardEvent)).toBe(true);
-      expect(paste).not.toHaveBeenCalled();
+      expect(handler?.(insert as unknown as KeyboardEvent)).toBe(false);
+      expect(insert.preventDefault).toHaveBeenCalled();
+      expect(paste).toHaveBeenCalledWith("selected text");
+      expect(readText).toHaveBeenCalledTimes(1);
+
+      selection = "";
+      paste.mockClear();
+      const repeatedInsert = {
+        ...insert,
+        preventDefault: vi.fn(),
+      };
+      expect(handler?.(repeatedInsert as unknown as KeyboardEvent)).toBe(false);
+      expect(paste).toHaveBeenCalledWith("selected text");
+      expect(readText).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("falls back to the clipboard when Shift+Insert has no terminal selection", async () => {
+    const readText = vi.fn(async () => "clipboard text");
+    vi.stubGlobal("navigator", { clipboard: { readText } });
+    try {
+      const runtime = new TerminalEmulatorRuntime({ isMac: false });
+      const paste = vi.fn();
+      let handler: ((event: KeyboardEvent) => boolean | undefined) | undefined;
+      runtime.attachKeyEventHandler({
+        attachCustomKeyEventHandler: (next) => {
+          handler = next;
+        },
+        hasSelection: () => false,
+        getSelection: () => "",
+        paste,
+        input: () => {},
+        scrollToBottom: () => {},
+      });
+      const event = {
+        type: "keydown",
+        key: "Insert",
+        ctrlKey: false,
+        shiftKey: true,
+        altKey: false,
+        metaKey: false,
+        isComposing: false,
+        preventDefault: vi.fn(),
+        stopPropagation: vi.fn(),
+      };
+
+      expect(handler?.(event as unknown as KeyboardEvent)).toBe(false);
+      expect(event.preventDefault).toHaveBeenCalled();
+      await vi.waitFor(() => expect(paste).toHaveBeenCalledWith("clipboard text"));
+      expect(readText).toHaveBeenCalledTimes(1);
     } finally {
       vi.unstubAllGlobals();
     }
